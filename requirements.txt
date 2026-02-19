@@ -1,0 +1,10 @@
+torch
+torchvision
+tqdm
+pyyaml
+diffusers
+transformers
+accelerate
+safetensors
+pillow
+matplotlib
