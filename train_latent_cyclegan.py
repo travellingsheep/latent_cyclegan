@@ -106,10 +106,44 @@ def load_checkpoint(
     if not isinstance(payload, dict) or "epoch" not in payload:
         raise ValueError(f"Invalid checkpoint format: {ckpt_path}")
 
+    def _load_discriminator_compat(module: nn.Module, sd: Any, name: str) -> None:
+        if not isinstance(sd, dict):
+            raise ValueError(f"Invalid discriminator state_dict for {name}")
+        try:
+            module.load_state_dict(sd)  # type: ignore[arg-type]
+            return
+        except Exception:
+            pass
+
+        # Backward-compat for older PatchDiscriminator:
+        # - removed InstanceNorm layer
+        # - applied spectral_norm to Conv2d, so weights moved to *.weight_orig
+        mapped: Dict[str, Any] = {}
+
+        def _map_conv(old_prefix: str, new_prefix: str) -> None:
+            w_key = f"{old_prefix}.weight"
+            b_key = f"{old_prefix}.bias"
+            if w_key in sd:
+                mapped[f"{new_prefix}.weight_orig"] = sd[w_key]
+            if b_key in sd:
+                mapped[f"{new_prefix}.bias"] = sd[b_key]
+
+        _map_conv("net.0", "net.0")
+        _map_conv("net.2", "net.2")
+        # old last conv was net.5; new last conv is net.4
+        _map_conv("net.5", "net.4")
+
+        missing, unexpected = module.load_state_dict(mapped, strict=False)
+        if missing or unexpected:
+            print(
+                f"[warn] Loaded discriminator '{name}' with compatibility mapping. "
+                f"missing={len(missing)} unexpected={len(unexpected)}"
+            )
+
     G.load_state_dict(payload["G"])  # type: ignore[arg-type]
     F.load_state_dict(payload["F"])  # type: ignore[arg-type]
-    D_A.load_state_dict(payload["D_A"])  # type: ignore[arg-type]
-    D_B.load_state_dict(payload["D_B"])  # type: ignore[arg-type]
+    _load_discriminator_compat(D_A, payload["D_A"], "D_A")
+    _load_discriminator_compat(D_B, payload["D_B"], "D_B")
 
     G.to(device)
     F.to(device)
@@ -306,36 +340,9 @@ class ResnetGenerator(nn.Module):
             nn.ReLU(inplace=True),
         ]
 
-        # downsample x2
-        mult = 1
-        for _ in range(2):
-            layers += [
-                nn.Conv2d(ngf * mult, ngf * mult * 2, kernel_size=3, stride=2, padding=1, bias=False),
-                nn.InstanceNorm2d(ngf * mult * 2, affine=False, track_running_stats=False),
-                nn.ReLU(inplace=True),
-            ]
-            mult *= 2
-
         # res blocks
         for _ in range(n_res_blocks):
-            layers += [ResnetBlock(ngf * mult)]
-
-        # upsample x2
-        for _ in range(2):
-            layers += [
-                nn.ConvTranspose2d(
-                    ngf * mult,
-                    ngf * mult // 2,
-                    kernel_size=3,
-                    stride=2,
-                    padding=1,
-                    output_padding=1,
-                    bias=False,
-                ),
-                nn.InstanceNorm2d(ngf * mult // 2, affine=False, track_running_stats=False),
-                nn.ReLU(inplace=True),
-            ]
-            mult //= 2
+            layers += [ResnetBlock(ngf)]
 
         # output
         layers += [
@@ -359,48 +366,29 @@ class ResnetGenerator(nn.Module):
 class PatchDiscriminator(nn.Module):
     def __init__(self, in_ch: int = 4, ndf: int = 32, n_layers: int = 3):
         super().__init__()
+        _ = n_layers  # kept for backward-compatible constructor/config usage
 
-        kw = 4
-        padw = 1
+        from torch.nn.utils import spectral_norm
+
+        def sn(layer: nn.Module) -> nn.Module:
+            return spectral_norm(layer)
 
         seq: List[nn.Module] = [
-            nn.Conv2d(in_ch, ndf, kernel_size=kw, stride=2, padding=padw),
+            sn(nn.Conv2d(in_ch, ndf, kernel_size=3, stride=1, padding=1)),
             nn.LeakyReLU(0.2, inplace=True),
-        ]
-
-        nf_mult = 1
-        for n in range(1, n_layers):
-            nf_mult_prev = nf_mult
-            nf_mult = min(2 ** n, 8)
-            seq += [
+            sn(
                 nn.Conv2d(
-                    ndf * nf_mult_prev,
-                    ndf * nf_mult,
-                    kernel_size=kw,
-                    stride=2,
-                    padding=padw,
-                    bias=False,
-                ),
-                nn.InstanceNorm2d(ndf * nf_mult, affine=False, track_running_stats=False),
-                nn.LeakyReLU(0.2, inplace=True),
-            ]
-
-        nf_mult_prev = nf_mult
-        nf_mult = min(2 ** n_layers, 8)
-        seq += [
-            nn.Conv2d(
-                ndf * nf_mult_prev,
-                ndf * nf_mult,
-                kernel_size=kw,
+                ndf,
+                ndf * 2,
+                kernel_size=3,
                 stride=1,
-                padding=padw,
+                padding=1,
                 bias=False,
+                )
             ),
-            nn.InstanceNorm2d(ndf * nf_mult, affine=False, track_running_stats=False),
             nn.LeakyReLU(0.2, inplace=True),
+            sn(nn.Conv2d(ndf * 2, 1, kernel_size=3, stride=1, padding=1)),
         ]
-
-        seq += [nn.Conv2d(ndf * nf_mult, 1, kernel_size=kw, stride=1, padding=padw)]
 
         self.net = nn.Sequential(*seq)
 

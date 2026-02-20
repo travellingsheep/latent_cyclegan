@@ -8,3 +8,5 @@ accelerate
 safetensors
 pillow
 matplotlib
+clean-fid
+numpy

@@ -19,12 +19,12 @@ model:
   in_channels: 4
   out_channels: 4
   # Smaller than image CycleGAN
-  ngf: 32
-  ndf: 32
+  ngf: 256
+  ndf: 64
   n_res_blocks: 4
   d_layers: 3
   # For latents, default is unconstrained output
-  out_activation: "none"  # one of: none, tanh
+  out_activation: "tanh"  # one of: none, tanh
 
 train:
   device: "cuda"   # "cuda" or "cpu"
@@ -58,11 +58,11 @@ train:
   d_loss_scale: 0.5
 
   # CycleGAN loss weight
-  lambda_cyc: 10.0
+  lambda_cyc: 5.0
 
   # Identity loss: L_id = E_y||G(y)-y||1 + E_x||F(x)-x||1
   # Common practice: total adds (lambda_cyc * lambda_id) * L_id
-  lambda_id: 0.5
+  lambda_id: 0.2
 
 logging:
   # tqdm fixed width; bar length is fixed via bar_format
@@ -90,8 +90,9 @@ eval:
   # If empty, evaluator will use {train.checkpoint_dir}/last.pt
   checkpoint_path: ""
   out_dir: "outputs/eval"
-  testA_dir: "datasets/monet2photo/testA"   # e.g. monet
-  testB_dir: "datasets/monet2photo/testB"   # e.g. photo
+  # Default test image dirs in this repo
+  testA_dir: "datasets/testA"
+  testB_dir: "datasets/testB"
 
   # Optional: CLIP config (transformers)
   clip_model_id: "openai/clip-vit-base-patch32"
