@@ -308,11 +308,15 @@ class ResnetBlock(nn.Module):
         super().__init__()
         self.block = nn.Sequential(
             nn.ReflectionPad2d(1),
-            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, bias=False),
+            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, groups=dim, bias=False),
+            # nn.ReflectionPad2d(1),
+            nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False),
             nn.InstanceNorm2d(dim, affine=False, track_running_stats=False),
             nn.ReLU(inplace=True),
+            # nn.ReflectionPad2d(1),
             nn.ReflectionPad2d(1),
-            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, bias=False),
+            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, groups=dim, bias=False),
+            nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False),
             nn.InstanceNorm2d(dim, affine=False, track_running_stats=False),
         )
 
@@ -334,8 +338,8 @@ class ResnetGenerator(nn.Module):
 
         # c7s1
         layers += [
-            nn.ReflectionPad2d(3),
-            nn.Conv2d(in_ch, ngf, kernel_size=7, stride=1, padding=0, bias=False),
+            nn.ReflectionPad2d(2),
+            nn.Conv2d(in_ch, ngf, kernel_size=5, stride=1, padding=0, bias=False),
             nn.InstanceNorm2d(ngf, affine=False, track_running_stats=False),
             nn.ReLU(inplace=True),
         ]
@@ -346,8 +350,8 @@ class ResnetGenerator(nn.Module):
 
         # output
         layers += [
-            nn.ReflectionPad2d(3),
-            nn.Conv2d(ngf, out_ch, kernel_size=7, stride=1, padding=0, bias=True),
+            nn.ReflectionPad2d(2),
+            nn.Conv2d(ngf, out_ch, kernel_size=5, stride=1, padding=0, bias=True),
         ]
 
         if out_activation.lower() == "tanh":
@@ -374,14 +378,14 @@ class PatchDiscriminator(nn.Module):
             return spectral_norm(layer)
 
         seq: List[nn.Module] = [
-            sn(nn.Conv2d(in_ch, ndf, kernel_size=3, stride=1, padding=1)),
+            sn(nn.Conv2d(in_ch, ndf, kernel_size=4, stride=2, padding=1)),
             nn.LeakyReLU(0.2, inplace=True),
             sn(
                 nn.Conv2d(
                 ndf,
                 ndf * 2,
-                kernel_size=3,
-                stride=1,
+                kernel_size=4,
+                stride=2,
                 padding=1,
                 bias=False,
                 )
@@ -440,6 +444,55 @@ def write_jsonl_line(path: str, obj: Dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def _plot_loss_curves(epoch_logs: List[Dict[str, Any]], out_path: str) -> None:
+    """Plot loss curves vs epoch and save to out_path.
+
+    This is intentionally lightweight: it overwrites a single PNG each epoch.
+    """
+    if not epoch_logs:
+        return
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt  # type: ignore
+    except Exception:
+        # Plotting is optional; training should still work without matplotlib.
+        return
+
+    def _series(key: str) -> List[float]:
+        vals: List[float] = []
+        for d in epoch_logs:
+            v = d.get(key)
+            try:
+                vals.append(float(v))
+            except Exception:
+                vals.append(float("nan"))
+        return vals
+
+    epochs = [int(d.get("epoch", i + 1)) for i, d in enumerate(epoch_logs)]
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, _series("loss_G"), label="G total")
+    plt.plot(epochs, _series("loss_D"), label="D total")
+    plt.plot(epochs, _series("loss_gan_G"), label="GAN(G)")
+    plt.plot(epochs, _series("loss_gan_F"), label="GAN(F)")
+    plt.plot(epochs, _series("loss_cyc"), label="cycle")
+    plt.plot(epochs, _series("loss_id"), label="identity")
+
+    plt.xlabel("epoch")
+    plt.ylabel("loss")
+    plt.title("Training loss curves")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    plt.savefig(out_path, dpi=160)
+    plt.close()
 
 
 def _mean(values: List[float]) -> float:
@@ -502,6 +555,7 @@ def train(cfg: Dict[str, Any]) -> None:
     log_dir = str(log_cfg.get("log_dir", "outputs/logs"))
     log_file = str(log_cfg.get("log_file", "train_log.jsonl"))
     log_path = os.path.join(log_dir, log_file)
+    loss_plot_path = os.path.join(log_dir, "loss_curves.png")
 
     vis_every = int(vis_cfg.get("every_epochs", 5))
     vis_dir = str(vis_cfg.get("out_dir", "outputs/vis"))
@@ -618,6 +672,8 @@ def train(cfg: Dict[str, Any]) -> None:
 
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(vis_dir, exist_ok=True)
+
+    epoch_logs_for_plot: List[Dict[str, Any]] = []
 
     for epoch in range(start_epoch, epochs + 1):
         epoch_start = time.time()
@@ -764,6 +820,10 @@ def train(cfg: Dict[str, Any]) -> None:
             "latent_divisor": latent_divisor,
         }
         write_jsonl_line(log_path, epoch_log)
+
+        # Update loss curve plot once per epoch.
+        epoch_logs_for_plot.append(epoch_log)
+        _plot_loss_curves(epoch_logs_for_plot, loss_plot_path)
 
         # Step schedulers per-epoch (after logging this epoch)
         sched_G.step()

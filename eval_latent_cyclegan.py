@@ -118,11 +118,15 @@ class ResnetBlock(nn.Module):
         super().__init__()
         self.block = nn.Sequential(
             nn.ReflectionPad2d(1),
-            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, bias=False),
+            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, groups=dim, bias=False),
+            # nn.ReflectionPad2d(1),
+            nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False),
             nn.InstanceNorm2d(dim, affine=False, track_running_stats=False),
             nn.ReLU(inplace=True),
+            # nn.ReflectionPad2d(1),
             nn.ReflectionPad2d(1),
-            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, bias=False),
+            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, groups=dim, bias=False),
+            nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False),
             nn.InstanceNorm2d(dim, affine=False, track_running_stats=False),
         )
 
@@ -150,8 +154,8 @@ class ResnetGenerator(nn.Module):
 
         # c7s1
         layers += [
-            nn.ReflectionPad2d(3),
-            nn.Conv2d(in_ch, ngf, kernel_size=7, stride=1, padding=0, bias=False),
+            nn.ReflectionPad2d(2),
+            nn.Conv2d(in_ch, ngf, kernel_size=5, stride=1, padding=0, bias=False),
             nn.InstanceNorm2d(ngf, affine=False, track_running_stats=False),
             nn.ReLU(inplace=True),
         ]
@@ -162,8 +166,8 @@ class ResnetGenerator(nn.Module):
 
         # output
         layers += [
-            nn.ReflectionPad2d(3),
-            nn.Conv2d(ngf, out_ch, kernel_size=7, stride=1, padding=0, bias=True),
+            nn.ReflectionPad2d(2),
+            nn.Conv2d(ngf, out_ch, kernel_size=5, stride=1, padding=0, bias=True),
         ]
 
         if out_activation.lower() == "tanh":

@@ -13,7 +13,7 @@ data:
   # Extra latent scaling for training stability:
   # model_input = raw_latent / latent_divisor
   # visualization decode uses raw_latent = model_latent * latent_divisor
-  latent_divisor: 10.0
+  latent_divisor: 1
 
 model:
   in_channels: 4
@@ -21,10 +21,10 @@ model:
   # Smaller than image CycleGAN
   ngf: 256
   ndf: 64
-  n_res_blocks: 4
+  n_res_blocks: 9
   d_layers: 3
   # For latents, default is unconstrained output
-  out_activation: "tanh"  # one of: none, tanh
+  out_activation: "none"  # one of: none, tanh
 
 train:
   device: "cuda"   # "cuda" or "cpu"
@@ -58,11 +58,11 @@ train:
   d_loss_scale: 0.5
 
   # CycleGAN loss weight
-  lambda_cyc: 5.0
+  lambda_cyc: 2.0
 
   # Identity loss: L_id = E_y||G(y)-y||1 + E_x||F(x)-x||1
   # Common practice: total adds (lambda_cyc * lambda_id) * L_id
-  lambda_id: 0.2
+  lambda_id: 0.1
 
 logging:
   # tqdm fixed width; bar length is fixed via bar_format
@@ -75,7 +75,7 @@ logging:
 visualization:
   every_epochs: 1
   out_dir: "outputs/vis"
-  num_samples: 4
+  num_samples: 2
 
   # VAE for decoding latents -> RGB (for visualization only)
   # Examples:

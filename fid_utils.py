@@ -41,6 +41,61 @@ def _try_symlink(src: Path, dst: Path) -> None:
         shutil.copy2(src, dst)
 
 
+def _to_torch_device(device: object):
+    """Convert user-supplied device into torch.device when possible."""
+    try:
+        import torch
+
+        if isinstance(device, torch.device):
+            return device
+        return torch.device(str(device))
+    except Exception:
+        return device
+
+
+def _build_cleanfid_model(cfid: object, *, mode: str, device: object):
+    """Best-effort creation of clean-fid feature extractor across versions."""
+    import inspect
+
+    candidates = [
+        "build_feature_extractor",
+        "get_feature_extractor",
+        "get_model",
+        "build_model",
+        "get_inception_model",
+    ]
+
+    for name in candidates:
+        fn = getattr(cfid, name, None)
+        if fn is None or (not callable(fn)):
+            continue
+        try:
+            sig = inspect.signature(fn)
+            kwargs = {}
+            if "mode" in sig.parameters:
+                kwargs["mode"] = mode
+            if "device" in sig.parameters:
+                kwargs["device"] = device
+            if kwargs:
+                model = fn(**kwargs)
+            else:
+                # Fallback: try (mode, device)
+                model = fn(mode, device)
+            if model is not None:
+                try:
+                    model.eval()
+                except Exception:
+                    pass
+                return model
+        except Exception:
+            continue
+
+    raise RuntimeError(
+        "clean-fid could not build the feature extractor model automatically. "
+        "Please upgrade clean-fid (e.g. pip install -U clean-fid) or file an issue with your version."
+    )
+
+
 def extract_features_for_paths(
     image_paths: Sequence[Path],
     *,
@@ -59,6 +114,7 @@ def extract_features_for_paths(
     """
 
     cfid = _ensure_cleanfid()
+    torch_device = _to_torch_device(device)
 
     img_list = [Path(p) for p in image_paths]
     if not img_list:
@@ -75,14 +131,46 @@ def extract_features_for_paths(
 
         # clean-fid reads from folder; it typically sorts filenames.
         # We enforce the same by our 000000__ prefix.
-        feats = cfid.get_folder_features(
-            str(tmp_dir),
-            mode=str(mode),
-            batch_size=int(batch_size),
-            num_workers=int(num_workers),
-            device=str(device),
-            verbose=False,
-        )
+        try:
+            feats = cfid.get_folder_features(
+                str(tmp_dir),
+                mode=str(mode),
+                batch_size=int(batch_size),
+                num_workers=int(num_workers),
+                device=torch_device,
+                verbose=False,
+            )
+        except TypeError as e:
+            # Some clean-fid versions accept model=None in signature but don't actually
+            # auto-create the feature extractor, resulting in: 'NoneType' object is not callable.
+            if "NoneType" in str(e) and "callable" in str(e):
+                model = _build_cleanfid_model(cfid, mode=str(mode), device=torch_device)
+                feats = cfid.get_folder_features(
+                    str(tmp_dir),
+                    model=model,
+                    mode=str(mode),
+                    batch_size=int(batch_size),
+                    num_workers=int(num_workers),
+                    device=torch_device,
+                    verbose=False,
+                )
+            else:
+                raise
+        except Exception as e:
+            # Same recovery path, but for wrapped exceptions.
+            if "NoneType" in str(e) and "callable" in str(e):
+                model = _build_cleanfid_model(cfid, mode=str(mode), device=torch_device)
+                feats = cfid.get_folder_features(
+                    str(tmp_dir),
+                    model=model,
+                    mode=str(mode),
+                    batch_size=int(batch_size),
+                    num_workers=int(num_workers),
+                    device=torch_device,
+                    verbose=False,
+                )
+            else:
+                raise
 
         # Ensure numpy array
         feats_np = np.asarray(feats)
