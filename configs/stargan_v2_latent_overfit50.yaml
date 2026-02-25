@@ -21,8 +21,8 @@ loss:
 
 training:
   seed: 42
-  batch_size: 16
-  num_epochs: 100
+  batch_size: 64
+  num_epochs: 1000
   lr_g: 1.0e-4
   lr_d: 1.0e-4
   lr_mapping: 1.0e-6
@@ -33,33 +33,33 @@ training:
   num_workers: 0
   pin_memory: true
   use_compile: true
-  compile_mode: reduce-overhead
+  compile_mode: default
   compile_dynamic: false
   compile_fullgraph: false
   compile_cudagraphs: false
   compile_generator: true
   compile_mapping_network: true
   compile_style_encoder: true
-  compile_discriminator: true
+  compile_discriminator: false
   drop_last: true
-  progress_bar: true
+  progress_bar: false
   progress_style: percent
   display_interval: 100
-  log_json: false
+  log_json: true
   log_interval: 50
   save_interval: 10
-  eval_interval: 10
+  # eval_interval: 10
 
 visualization:
   every_epochs: 1
   vae_model_name_or_path: "runwayml/stable-diffusion-v1-5"
   vae_subfolder: "vae"
   suppress_hf_warnings: true
-  num_samples: 5
+  num_samples: 4
   save_dir: "outputs/stargan_v2_baseline/vis"
 
 data:
-  data_root: "../pt_datasets/unscaled_dataset"
+  data_root: "../pt_datasets/overfit50"
   domains:
     - photo
     - Hayao
@@ -70,5 +70,5 @@ data:
   epoch_size: null
 
 checkpoint:
-  save_dir: "outputs/stargan_v2_baseline"
+  save_dir: "outputs/stargan_v2_overfit"
   resume_path: ""

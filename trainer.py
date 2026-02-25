@@ -1,17 +1,27 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Dict
+import warnings
 
 import torch
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 from torchvision.utils import make_grid, save_image
 
 try:
     from diffusers import AutoencoderKL
 except ImportError:
     AutoencoderKL = None
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    Image = None
+    ImageDraw = None
+    ImageFont = None
 
 from loss import (
     cycle_consistency_loss,
@@ -47,13 +57,19 @@ class StarGANv2Trainer:
         self.amp_dtype = training_cfg.get("amp_dtype", "bf16").lower()
         self.autocast_dtype = torch.bfloat16 if self.amp_dtype == "bf16" else torch.float16
 
-        self.scaler_d = torch.cuda.amp.GradScaler(enabled=self.use_amp and self.amp_dtype == "fp16")
-        self.scaler_g = torch.cuda.amp.GradScaler(enabled=self.use_amp and self.amp_dtype == "fp16")
+        scaler_enabled = self.use_amp and self.amp_dtype == "fp16"
+        if self.device.type == "cuda":
+            self.scaler_d = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
+            self.scaler_g = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
+        else:
+            self.scaler_d = torch.amp.GradScaler("cpu", enabled=False)
+            self.scaler_g = torch.amp.GradScaler("cpu", enabled=False)
 
         self.z_dim = int(config["model"].get("latent_dim", 16))
         self.num_domains = int(config["model"]["num_domains"])
         self.latent_scale = float(config.get("training", {}).get("latent_scale", 0.18215))
         self.w_r1 = float(config.get("loss", {}).get("w_r1", 10.0))
+        self.r1_interval = max(1, int(config.get("loss", {}).get("r1_interval", 16)))
 
         self.opt_d = torch.optim.AdamW(
             self.D.parameters(),
@@ -79,16 +95,34 @@ class StarGANv2Trainer:
         self.save_dir = Path(config["checkpoint"]["save_dir"])
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.save_interval = int(training_cfg.get("save_interval", 10))
-        self.eval_interval = int(training_cfg.get("eval_interval", self.save_interval))
         self.log_interval = int(training_cfg.get("log_interval", 50))
+        self.show_progress = bool(training_cfg.get("progress_bar", True))
+        self.progress_style = str(training_cfg.get("progress_style", "percent")).lower()
+        if self.progress_style not in {"bar", "percent", "off"}:
+            self.progress_style = "percent"
+        self.display_interval = int(training_cfg.get("display_interval", 100))
+        self.log_json = bool(training_cfg.get("log_json", False))
+        self.num_epochs = int(training_cfg.get("num_epochs", 1))
+        self.domain_names = list(config.get("data", {}).get("domains", []))
 
         if AutoencoderKL is None:
             raise ImportError("diffusers is required for VAE visualization. Please install diffusers.")
 
         vae_cfg = config.get("visualization", {})
+        self.visualize_every = int(
+            vae_cfg.get("every_epochs", training_cfg.get("eval_interval", self.save_interval))
+        )
         vis_save_dir = vae_cfg.get("save_dir", "")
         self.vis_dir = (Path(vis_save_dir) if vis_save_dir else (self.save_dir / "vis"))
         self.vis_dir.mkdir(parents=True, exist_ok=True)
+
+        if bool(vae_cfg.get("suppress_hf_warnings", True)):
+            warnings.filterwarnings(
+                "ignore",
+                message="The `local_dir_use_symlinks` argument is deprecated and ignored in `hf_hub_download`.*",
+                category=UserWarning,
+            )
+            logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
         vae_model = vae_cfg.get("vae_model_name_or_path", "runwayml/stable-diffusion-v1-5")
         vae_subfolder = vae_cfg.get("vae_subfolder", "vae")
@@ -170,6 +204,28 @@ class StarGANv2Trainer:
             self._cached_eval_batch = next(iter(self.loader))
         return self._cached_eval_batch
 
+    def _get_eval_domain_latents(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (content_raw, style_ref_raw) each with shape [N,4,H,W], one sample per domain.
+
+        Prefer pulling directly from dataset.domain_tensors to guarantee full domain coverage.
+        Fallback to a loader batch if dataset interface is unknown.
+        """
+        dataset = getattr(self.loader, "dataset", None)
+        if dataset is not None and hasattr(dataset, "domain_tensors") and hasattr(dataset, "num_domains"):
+            num_domains = int(getattr(dataset, "num_domains"))
+            latents = []
+            for domain_id in range(num_domains):
+                domain_bank = dataset.domain_tensors[domain_id]
+                latents.append(domain_bank[0])
+            content_raw = torch.stack(latents, dim=0)
+            style_ref_raw = torch.stack(latents, dim=0)
+            return content_raw, style_ref_raw
+
+        batch = self._get_eval_batch()
+        content_raw = batch["content"]
+        style_ref_raw = batch["target_style"]
+        return content_raw, style_ref_raw
+
     def _decode_latent_to_image(self, latent: torch.Tensor) -> torch.Tensor:
         latent = latent.to(self.device, dtype=self.vae_dtype)
         with torch.no_grad():
@@ -177,17 +233,83 @@ class StarGANv2Trainer:
         decoded = decoded.float().clamp(-1.0, 1.0)
         return (decoded + 1.0) / 2.0
 
+    def _save_grid_with_labels(
+        self,
+        grid_tensor: torch.Tensor,
+        domain_names: list[str],
+        out_path: Path,
+        n_vis: int,
+        cell_hw: tuple[int, int],
+        padding: int,
+    ) -> None:
+        if Image is None or ImageDraw is None or ImageFont is None:
+            return
+
+        if n_vis <= 0:
+            return
+
+        # grid_tensor: [3, H, W] in [0,1]
+        grid_u8 = (grid_tensor.detach().cpu().clamp(0.0, 1.0) * 255.0).to(torch.uint8)
+        grid_u8 = grid_u8.permute(1, 2, 0).contiguous().numpy()
+        grid_img = Image.fromarray(grid_u8)
+
+        font_size = 18
+        try:
+            font = ImageFont.truetype("DejaVuSans.ttf", font_size)
+        except Exception:
+            font = ImageFont.load_default()
+
+        left_margin = max(80, int(font_size * 4.5))
+        top_margin = max(26, int(font_size * 1.6))
+        canvas = Image.new("RGB", (grid_img.width + left_margin, grid_img.height + top_margin), (0, 0, 0))
+        canvas.paste(grid_img, (left_margin, top_margin))
+        draw = ImageDraw.Draw(canvas)
+
+        cell_h, cell_w = cell_hw
+
+        def cell_center(col: int, row: int) -> tuple[int, int]:
+            # col,row are indices in the (n_vis+1)x(n_vis+1) grid.
+            x0 = left_margin + padding + col * (cell_w + padding)
+            y0 = top_margin + padding + row * (cell_h + padding)
+            return (int(x0 + cell_w / 2), int(y0 + cell_h / 2))
+
+        # Column labels (targets) on top header row.
+        for j in range(n_vis):
+            name = domain_names[j] if j < len(domain_names) else str(j)
+            x, _ = cell_center(col=j + 1, row=0)
+            y = int(top_margin / 2)
+            draw.text((x, y), name, fill=(255, 255, 255), font=font, anchor="mm")
+
+        # Row labels (sources) on left header col.
+        for i in range(n_vis):
+            name = domain_names[i] if i < len(domain_names) else str(i)
+            x = int(left_margin / 2)
+            _, y = cell_center(col=0, row=i + 1)
+            draw.text((x, y), name, fill=(255, 255, 255), font=font, anchor="mm")
+
+        canvas.save(out_path)
+
     def evaluate(self, epoch: int) -> None:
         self.G.eval()
         self.E.eval()
 
-        batch = self._get_eval_batch()
-        content_raw = batch["content"].to(self.device, non_blocking=True)
-        style_ref_raw = batch["target_style"].to(self.device, non_blocking=True)
-        y_trg = batch["target_style_id"].to(self.device, non_blocking=True).long().view(-1)
+        content_raw, style_ref_raw = self._get_eval_domain_latents()
+        content_raw = content_raw.to(self.device, non_blocking=True)
+        style_ref_raw = style_ref_raw.to(self.device, non_blocking=True)
+
+        num_domains = int(self.cfg["model"]["num_domains"])
+        n_vis = min(num_domains, int(self.eval_num_samples))
+        content_raw = content_raw[:n_vis]
+        style_ref_raw = style_ref_raw[:n_vis]
 
         content_scaled = content_raw * self.latent_scale
         style_ref_scaled = style_ref_raw * self.latent_scale
+
+        content_for_decode = content_scaled / self.latent_scale
+        style_for_decode = style_ref_scaled / self.latent_scale
+
+        content_img = self._decode_latent_to_image(content_for_decode)
+        style_img = self._decode_latent_to_image(style_for_decode)
 
         with torch.no_grad():
             with torch.amp.autocast(
@@ -195,24 +317,51 @@ class StarGANv2Trainer:
                 enabled=self.use_amp,
                 dtype=self.autocast_dtype,
             ):
-                s_ref = self.E(style_ref_scaled, y_trg)
-                fake_latent_scaled = self.G(content_scaled, s_ref)
+                # Precompute one style vector per target domain.
+                target_styles = []
+                for j in range(n_vis):
+                    yj = torch.full((1,), j, device=self.device, dtype=torch.long)
+                    sj = self.E(style_ref_scaled[j : j + 1], yj)
+                    target_styles.append(sj)
 
-        content_for_decode = content_scaled / self.latent_scale
-        style_for_decode = style_ref_scaled / self.latent_scale
-        fake_for_decode = fake_latent_scaled / self.latent_scale
+                # Generate translations: for each target j, translate all sources i.
+                translated_latents = []
+                for j in range(n_vis):
+                    sj = target_styles[j].expand(n_vis, -1)
+                    fake_scaled = self.G(content_scaled, sj)
+                    translated_latents.append(fake_scaled)
 
-        n_vis = min(self.eval_num_samples, content_for_decode.size(0))
-        content_img = self._decode_latent_to_image(content_for_decode[:n_vis])
-        style_img = self._decode_latent_to_image(style_for_decode[:n_vis])
-        fake_img = self._decode_latent_to_image(fake_for_decode[:n_vis])
+        # translated_latents[j] has shape [n_vis,4,H,W] for target j
+        # Convert to images and form matrix with diagonal as identity (original content)
+        translated_imgs = []
+        for j in range(n_vis):
+            fake_for_decode = translated_latents[j] / self.latent_scale
+            translated_imgs.append(self._decode_latent_to_image(fake_for_decode))
 
-        rows = []
+        blank = torch.zeros_like(content_img[0])
+        grid_cells = [blank]
+
+        # Header row: target domain reference images
+        grid_cells.extend(style_img)
+
+        # Rows: source content header + translations
         for i in range(n_vis):
-            rows.extend([content_img[i], style_img[i], fake_img[i]])
-        grid = make_grid(torch.stack(rows, dim=0), nrow=3)
+            grid_cells.append(content_img[i])
+            for j in range(n_vis):
+                if i == j:
+                    grid_cells.append(content_img[i])
+                else:
+                    grid_cells.append(translated_imgs[j][i])
+
+        padding = 4
+        grid = make_grid(torch.stack(grid_cells, dim=0), nrow=n_vis + 1, padding=padding)
         out_path = self.vis_dir / f"epoch_{epoch:04d}.png"
         save_image(grid, out_path)
+
+        # Overwrite with labeled version if Pillow is available.
+        names = self.domain_names[:n_vis] if self.domain_names else [str(i) for i in range(n_vis)]
+        cell_hw = (int(content_img.shape[-2]), int(content_img.shape[-1]))
+        self._save_grid_with_labels(grid, names, out_path, n_vis=n_vis, cell_hw=cell_hw, padding=padding)
 
         self.G.train()
         self.E.train()
@@ -240,8 +389,28 @@ class StarGANv2Trainer:
         w_sty = float(loss_cfg.get("w_sty", 1.0))
         w_cyc = float(loss_cfg.get("w_cyc", 1.0))
 
-        for step, batch in enumerate(self.loader, start=1):
+        total_steps = len(self.loader)
+        use_tqdm = self.show_progress and self.progress_style == "bar"
+        if use_tqdm:
+            epoch_iter = tqdm(
+                self.loader,
+                desc=f"Epoch {epoch}/{self.num_epochs}",
+                total=total_steps,
+                dynamic_ncols=True,
+                leave=True,
+            )
+            iterator = enumerate(epoch_iter, start=1)
+        else:
+            epoch_iter = None
+            iterator = enumerate(self.loader, start=1)
+
+        for step, batch in iterator:
             try:
+                if self.device.type == "cuda" and hasattr(torch, "compiler"):
+                    mark_step_begin = getattr(torch.compiler, "cudagraph_mark_step_begin", None)
+                    if callable(mark_step_begin):
+                        mark_step_begin()
+
                 content = batch["content"].to(self.device, non_blocking=True)
                 x_ref = batch["target_style"].to(self.device, non_blocking=True)
                 y_trg = batch["target_style_id"].to(self.device, non_blocking=True).long().view(-1)
@@ -260,21 +429,29 @@ class StarGANv2Trainer:
                     enabled=self.use_amp,
                     dtype=self.autocast_dtype,
                 ):
-                    x_ref_r1 = x_ref.detach().requires_grad_(True)
                     s_ref = self.E(x_ref, y_trg)
                     s_lat = self.F(z_trg, y_trg)
 
                     fake_ref = self.G(content, s_ref)
                     fake_lat = self.G(content, s_lat)
 
-                    real_logits = self.D(x_ref_r1, y_trg)
+                    real_logits = self.D(x_ref, y_trg)
                     fake_ref_logits_d = self.D(fake_ref.detach(), y_trg)
                     fake_lat_logits_d = self.D(fake_lat.detach(), y_trg)
 
                     d_loss_ref = d_hinge_loss(real_logits, fake_ref_logits_d)
                     d_loss_lat = d_hinge_loss(real_logits, fake_lat_logits_d)
-                    r1_loss = r1_penalty(real_logits, x_ref_r1)
-                    d_loss = 0.5 * (d_loss_ref + d_loss_lat) + self.w_r1 * r1_loss
+                    d_loss = 0.5 * (d_loss_ref + d_loss_lat)
+
+                do_r1 = (step % self.r1_interval == 0)
+                if do_r1:
+                    x_ref_r1 = x_ref.detach().requires_grad_(True)
+                    with torch.amp.autocast(device_type=self.device.type, enabled=False):
+                        real_logits_r1 = self.D(x_ref_r1.float(), y_trg)
+                        r1_loss = r1_penalty(real_logits_r1, x_ref_r1)
+                    d_loss = d_loss + (self.w_r1 * self.r1_interval) * r1_loss
+                else:
+                    r1_loss = torch.zeros((), device=self.device)
 
                 self.opt_d.zero_grad(set_to_none=True)
                 if self.scaler_d.is_enabled():
@@ -347,22 +524,47 @@ class StarGANv2Trainer:
 
                 num_steps += 1
 
-                if step % self.log_interval == 0:
+                if step % self.log_interval == 0 and self.log_json:
                     printable = {k: round(v, 5) for k, v in logs.items()}
                     printable["epoch"] = epoch
                     printable["step"] = step
                     printable["lambda_ds"] = round(ds_weight, 6)
                     print(json.dumps(printable, ensure_ascii=False))
 
+                if step % self.display_interval == 0:
+                    progress = 100.0 * step / max(1, total_steps)
+                    if use_tqdm:
+                        epoch_iter.set_postfix(
+                            pct=f"{progress:.1f}%",
+                            d=round(logs["d_loss"], 4),
+                            g=round(logs["g_loss"], 4),
+                            r1=round(logs["r1"], 4),
+                        )
+                    elif self.show_progress and self.progress_style == "percent":
+                        msg = (
+                            f"\rEpoch {epoch}/{self.num_epochs} | "
+                            f"{progress:6.2f}% | "
+                            f"d={logs['d_loss']:.4f} g={logs['g_loss']:.4f} r1={logs['r1']:.4f}"
+                        )
+                        print(msg, end="", flush=True)
+
             except RuntimeError as exc:
                 if "out of memory" in str(exc).lower():
-                    print(f"[OOM] epoch={epoch}, step={step}. batch skipped.")
+                    if use_tqdm:
+                        epoch_iter.write(f"[OOM] epoch={epoch}, step={step}. batch skipped.")
+                    else:
+                        print(f"\n[OOM] epoch={epoch}, step={step}. batch skipped.")
                     self.opt_d.zero_grad(set_to_none=True)
                     self.opt_g.zero_grad(set_to_none=True)
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     continue
                 raise
+
+        if use_tqdm:
+            epoch_iter.close()
+        elif self.show_progress and self.progress_style == "percent":
+            print()
 
         if num_steps == 0:
             mean_logs = {k: float("nan") for k in running}
@@ -371,7 +573,7 @@ class StarGANv2Trainer:
 
         if epoch % self.save_interval == 0:
             self._save_checkpoint(epoch)
-        if epoch % self.eval_interval == 0:
+        if epoch % self.visualize_every == 0:
             self.evaluate(epoch)
 
         return mean_logs
