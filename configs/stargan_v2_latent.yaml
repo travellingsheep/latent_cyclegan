@@ -1,0 +1,56 @@
+model:
+  latent_channels: 4
+  style_dim: 64
+  base_dim: 256
+  num_domains: 5
+  n_res_blocks: 4
+  d_layers: 3
+
+  latent_dim: 16
+  mapping_hidden_dim: 512
+  mapping_shared_layers: 3
+
+loss:
+  w_adv: 1.0
+  w_sty: 1.0
+  w_ds: 1.0
+  w_cyc: 1.0
+  w_r1: 10.0
+  ds_decay_epochs: 20
+
+training:
+  seed: 42
+  batch_size: 16
+  num_epochs: 100
+  lr_g: 1.0e-4
+  lr_d: 1.0e-4
+  lr_mapping: 1.0e-6
+  weight_decay: 1.0e-4
+  use_amp: true
+  amp_dtype: bf16
+  latent_scale: 0.18215
+  num_workers: 0
+  log_interval: 50
+  save_interval: 10
+  eval_interval: 10
+
+visualization:
+  vae_model_name_or_path: "runwayml/stable-diffusion-v1-5"
+  vae_subfolder: "vae"
+  num_samples: 4
+  save_dir: "../outputs/stargan_v2_baseline/vis"
+
+data:
+  data_root: "../pt_datasets/unscaled_dataset"
+  domains:
+    - photo
+    - Hayao
+    - monet
+    - cezanne
+    - vangogh
+  preload_to_gpu: true
+  epoch_size: null
+
+checkpoint:
+  save_dir: "../outputs/stargan_v2_baseline"
+  resume_path: ""

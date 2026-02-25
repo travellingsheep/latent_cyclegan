@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
 
-import utils.eval_latent_cyclegan as ev
+import eval_latent_cyclegan as ev
 import fid_utils
 
 
