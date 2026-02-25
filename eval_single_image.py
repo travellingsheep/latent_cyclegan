@@ -121,11 +121,12 @@ def main() -> None:
     # Metrics settings (subset; defaults mirror eval_latent_cyclegan.py)
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=1)
-    # NOTE: style metrics were removed; these legacy args are kept only for backward compatibility.
-    parser.add_argument("--max_ref_cache", type=int, default=256, help="(unused; style metrics removed)")
-    parser.add_argument("--max_ref_compare", type=int, default=50, help="(unused; style metrics removed)")
-    parser.add_argument("--cache_dir", type=str, default="outputs/eval_cache", help="(unused; style metrics removed)")
-    parser.add_argument("--force_regen_cache", action="store_true", help="(unused; style metrics removed)")
+    # style_clip settings: compare the generated image to a cached reference set.
+    # (A2B uses --testB, B2A uses --testA as reference set roots.)
+    parser.add_argument("--max_ref_cache", type=int, default=256, help="Reference cache size for style_clip (0 disables)")
+    parser.add_argument("--max_ref_compare", type=int, default=50, help="How many cached refs to compare per image for style_clip (<=0 means all)")
+    parser.add_argument("--cache_dir", type=str, default="outputs/eval_cache", help="Cache directory for style_clip reference embeddings")
+    parser.add_argument("--force_regen_cache", action="store_true", help="Recompute style_clip reference cache even if exists")
 
     parser.add_argument("--disable_lpips", action="store_true")
     parser.add_argument("--disable_clip", action="store_true")
@@ -238,10 +239,10 @@ def main() -> None:
 
     image_size = int(eval_cfg.get("image_size", args.image_size))
     batch_size = int(eval_cfg.get("batch_size", args.batch_size))
-    _ = int(eval_cfg.get("max_ref_cache", args.max_ref_cache))
-    _ = int(eval_cfg.get("max_ref_compare", args.max_ref_compare))
-    _ = str(eval_cfg.get("cache_dir", args.cache_dir)).strip() or str(args.cache_dir)
-    _ = bool(eval_cfg.get("force_regen_cache", False)) or bool(args.force_regen_cache)
+    max_ref_cache = int(eval_cfg.get("max_ref_cache", args.max_ref_cache))
+    max_ref_compare = int(eval_cfg.get("max_ref_compare", args.max_ref_compare))
+    cache_dir = str(eval_cfg.get("cache_dir", args.cache_dir)).strip() or str(args.cache_dir)
+    force_regen_cache = bool(eval_cfg.get("force_regen_cache", False)) or bool(args.force_regen_cache)
 
     disable_lpips = bool(eval_cfg.get("disable_lpips", False)) or bool(args.disable_lpips)
     disable_clip = bool(eval_cfg.get("disable_clip", False)) or bool(args.disable_clip)
@@ -252,6 +253,10 @@ def main() -> None:
         image_size=image_size,
         batch_size=batch_size,
         max_src_samples=0,
+        max_ref_cache=max_ref_cache,
+        max_ref_compare=max_ref_compare,
+        cache_dir=cache_dir or "outputs/eval_cache",
+        force_regen_cache=force_regen_cache,
         disable_lpips=disable_lpips,
         disable_clip=disable_clip,
         clip_model_id=clip_model_id or "openai/clip-vit-base-patch32",
@@ -299,6 +304,7 @@ def main() -> None:
         "gen_image",
         "content_lpips",
         "content_clip",
+        "style_clip",
         "fid",
     ]
 
@@ -307,6 +313,35 @@ def main() -> None:
 
     src_root = None
     gen_root = (out_dir / "gen") if cfg_eval.compact_paths else None
+
+    # style reference embeddings (optional): use --testA/--testB as reference sets.
+    style_ref_a = None
+    style_ref_b = None
+    if (clip_model is not None) and (clip_processor is not None) and (not cfg_eval.disable_clip):
+        if testA is not None and testA.exists():
+            try:
+                style_ref_a = ev._load_or_build_clip_ref_cache(
+                    ref_dir=testA,
+                    ref_paths=ev._list_images(testA),
+                    clip_model=clip_model,
+                    clip_processor=clip_processor,
+                    device=device,
+                    cfg=cfg_eval,
+                )
+            except Exception:
+                style_ref_a = None
+        if testB is not None and testB.exists():
+            try:
+                style_ref_b = ev._load_or_build_clip_ref_cache(
+                    ref_dir=testB,
+                    ref_paths=ev._list_images(testB),
+                    clip_model=clip_model,
+                    clip_processor=clip_processor,
+                    device=device,
+                    cfg=cfg_eval,
+                )
+            except Exception:
+                style_ref_b = None
 
     if imageA_path is not None:
         rows_a2b = ev.evaluate_direction(
@@ -326,6 +361,7 @@ def main() -> None:
             lpips_fn=lpips_fn,
             clip_model=clip_model,
             clip_processor=clip_processor,
+            style_ref_clip=style_ref_b,
         )
 
     if imageB_path is not None:
@@ -346,6 +382,7 @@ def main() -> None:
             lpips_fn=lpips_fn,
             clip_model=clip_model,
             clip_processor=clip_processor,
+            style_ref_clip=style_ref_a,
         )
 
     # FID: A2B uses domain B stats; B2A uses domain A stats.

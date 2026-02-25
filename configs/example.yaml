@@ -58,7 +58,7 @@ train:
   d_loss_scale: 0.5
 
   # CycleGAN loss weight
-  lambda_cyc: 2.0
+  lambda_cyc: 0.5
 
   # Identity loss: L_id = E_y||G(y)-y||1 + E_x||F(x)-x||1
   # Common practice: total adds (lambda_cyc * lambda_id) * L_id

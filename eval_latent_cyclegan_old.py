@@ -12,10 +12,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import numpy as np
-
-import fid_utils
-
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
@@ -119,15 +115,11 @@ class ResnetBlock(nn.Module):
         super().__init__()
         self.block = nn.Sequential(
             nn.ReflectionPad2d(1),
-            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, groups=dim, bias=False),
-            # nn.ReflectionPad2d(1),
-            nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, bias=False),
             nn.InstanceNorm2d(dim, affine=False, track_running_stats=False),
             nn.ReLU(inplace=True),
-            # nn.ReflectionPad2d(1),
             nn.ReflectionPad2d(1),
-            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, groups=dim, bias=False),
-            nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, bias=False),
             nn.InstanceNorm2d(dim, affine=False, track_running_stats=False),
         )
 
@@ -136,12 +128,6 @@ class ResnetBlock(nn.Module):
 
 
 class ResnetGenerator(nn.Module):
-    """Generator architecture.
-
-    NOTE: This is expected to match the current `train_latent_cyclegan.py::ResnetGenerator`.
-    This evaluator intentionally supports only the current training checkpoint format.
-    """
-
     def __init__(
         self,
         in_ch: int = 4,
@@ -153,22 +139,44 @@ class ResnetGenerator(nn.Module):
         super().__init__()
         layers: List[nn.Module] = []
 
-        # c7s1
         layers += [
-            nn.ReflectionPad2d(2),
-            nn.Conv2d(in_ch, ngf, kernel_size=5, stride=1, padding=0, bias=False),
+            nn.ReflectionPad2d(3),
+            nn.Conv2d(in_ch, ngf, kernel_size=7, stride=1, padding=0, bias=False),
             nn.InstanceNorm2d(ngf, affine=False, track_running_stats=False),
             nn.ReLU(inplace=True),
         ]
 
-        # res blocks
-        for _ in range(n_res_blocks):
-            layers += [ResnetBlock(ngf)]
+        mult = 1
+        for _ in range(2):
+            layers += [
+                nn.Conv2d(ngf * mult, ngf * mult * 2, kernel_size=3, stride=2, padding=1, bias=False),
+                nn.InstanceNorm2d(ngf * mult * 2, affine=False, track_running_stats=False),
+                nn.ReLU(inplace=True),
+            ]
+            mult *= 2
 
-        # output
+        for _ in range(n_res_blocks):
+            layers += [ResnetBlock(ngf * mult)]
+
+        for _ in range(2):
+            layers += [
+                nn.ConvTranspose2d(
+                    ngf * mult,
+                    ngf * mult // 2,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                    output_padding=1,
+                    bias=False,
+                ),
+                nn.InstanceNorm2d(ngf * mult // 2, affine=False, track_running_stats=False),
+                nn.ReLU(inplace=True),
+            ]
+            mult //= 2
+
         layers += [
-            nn.ReflectionPad2d(2),
-            nn.Conv2d(ngf, out_ch, kernel_size=5, stride=1, padding=0, bias=True),
+            nn.ReflectionPad2d(3),
+            nn.Conv2d(ngf, out_ch, kernel_size=7, stride=1, padding=0, bias=True),
         ]
 
         if out_activation.lower() == "tanh":
@@ -185,14 +193,12 @@ class ResnetGenerator(nn.Module):
 
 
 def _load_ckpt(path: Path) -> Dict[str, Any]:
-    try:
-        payload = torch.load(path, map_location="cpu", weights_only=False)
-    except TypeError:
-        # Older torch versions don't support weights_only.
-        payload = torch.load(path, map_location="cpu")
+    payload = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
         raise ValueError(f"Invalid checkpoint: {path}")
-    # Current train_latent_cyclegan.py stores config under 'cfg'
+    # train_latent_cyclegan.py stores config under 'cfg'
+    if "cfg" not in payload and "config" in payload:
+        payload["cfg"] = payload.get("config")
     return payload
 
 
@@ -233,138 +239,46 @@ class EvalConfig:
     device: str = "cuda"
 
 
-def _to_lpips_input(img01: torch.Tensor) -> torch.Tensor:
-    # lpips expects [-1,1]
-    return img01 * 2.0 - 1.0
-
-
-def _sha1_short(text: str, n: int = 12) -> str:
-    h = hashlib.sha1(text.encode("utf-8")).hexdigest()
-    return h[: max(4, int(n))]
+def _hash_dir(path: Path) -> str:
+    return hashlib.md5(str(path.resolve()).encode("utf-8")).hexdigest()[:10]
 
 
 @torch.no_grad()
-def _load_or_build_clip_ref_cache(
-    *,
-    ref_dir: Path,
+def _compute_ref_clip_matrix(
     ref_paths: Sequence[Path],
     clip_model: Any,
     clip_processor: Any,
     device: torch.device,
-    cfg: EvalConfig,
+    image_size: int,
+    max_ref_cache: int,
 ) -> Optional[torch.Tensor]:
-    """Return normalized CLIP embeddings [N,D] for a reference image set.
+    from PIL import Image
 
-    Uses cfg.cache_dir as an on-disk cache to avoid recomputing for repeated eval runs.
-    Cache key includes (ref_dir, clip_model_id, max_ref_cache, image_size).
-    """
-
-    if clip_model is None or clip_processor is None:
-        return None
-
-    max_ref_cache = int(getattr(cfg, "max_ref_cache", 0))
-    if max_ref_cache == 0:
-        return None
-
-    paths = sorted([Path(p) for p in ref_paths])
     if max_ref_cache > 0:
-        paths = paths[: min(len(paths), max_ref_cache)]
-    if not paths:
+        ref_paths = ref_paths[: min(len(ref_paths), int(max_ref_cache))]
+    if not ref_paths:
         return None
 
-    cache_root = Path(str(getattr(cfg, "cache_dir", "") or "outputs/eval_cache")).expanduser()
-    cache_root.mkdir(parents=True, exist_ok=True)
-
-    key = "|".join(
-        [
-            str(ref_dir.resolve()),
-            str(getattr(cfg, "clip_model_id", "")),
-            str(int(getattr(cfg, "image_size", 256))),
-            str(int(max_ref_cache)),
-        ]
-    )
-    cache_path = cache_root / f"clip_ref_{_sha1_short(key)}.npz"
-
-    if cache_path.exists() and (not bool(getattr(cfg, "force_regen_cache", False))):
-        try:
-            d = np.load(cache_path, allow_pickle=False)
-            emb = np.asarray(d["embeddings"], dtype=np.float32)
-            if emb.ndim == 2 and emb.shape[0] > 0:
-                return torch.from_numpy(emb).to(dtype=torch.float32)
-        except Exception:
-            pass
-
-    try:
-        from PIL import Image
-    except Exception:
-        print("[warn] style_clip disabled: pillow is missing. Install: pip install pillow")
-        return None
-
-    embeds: List[torch.Tensor] = []
-    # Use a fixed, moderately large batch size for reference embedding extraction.
-    # (Do NOT reuse eval batch_size; single-image eval defaults to 1 and would be too slow.)
+    embs: List[torch.Tensor] = []
     bs = 32
-    for start in range(0, len(paths), bs):
-        batch_paths = paths[start : start + bs]
-        pil_imgs = []
-        for p in batch_paths:
-            try:
-                pil_imgs.append(Image.open(p).convert("RGB"))
-            except Exception:
-                pil_imgs.append(Image.new("RGB", (int(cfg.image_size), int(cfg.image_size)), color=(0, 0, 0)))
-
-        inputs = clip_processor(images=pil_imgs, return_tensors="pt").to(device)
+    for i in range(0, len(ref_paths), bs):
+        batch_paths = ref_paths[i : i + bs]
+        batch_pils = [Image.open(p).convert("RGB").resize((image_size, image_size)) for p in batch_paths]
+        inputs = clip_processor(images=batch_pils, return_tensors="pt").to(device)
         out = clip_model.get_image_features(**inputs)
-        emb = _extract_clip_embeddings(out).to(device, dtype=torch.float32)
-        if emb.ndim == 1:
-            emb = emb.unsqueeze(0)
-        emb = emb / (emb.norm(p=2, dim=-1, keepdim=True) + 1e-8)
-        embeds.append(emb.detach().cpu())
+        e = _extract_clip_embeddings(out).to(device, dtype=torch.float32)
+        if e.ndim == 1:
+            e = e.unsqueeze(0)
+        e = e / (e.norm(p=2, dim=-1, keepdim=True) + 1e-8)
+        embs.append(e.detach().cpu())
 
-    ref_emb = torch.cat(embeds, dim=0).to(dtype=torch.float32)
-    try:
-        np.savez(
-            cache_path,
-            embeddings=ref_emb.numpy(),
-            ref_dir=str(ref_dir),
-            clip_model_id=str(getattr(cfg, "clip_model_id", "")),
-            image_size=int(getattr(cfg, "image_size", 256)),
-            max_ref_cache=int(max_ref_cache),
-            count=int(ref_emb.shape[0]),
-            dim=int(ref_emb.shape[1]),
-        )
-    except Exception:
-        pass
-
-    return ref_emb
+    mat = torch.cat(embs, dim=0)
+    return mat
 
 
-def _compute_style_proto(style_ref_clip: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-    """Compute style prototype CLIP vector from reference embeddings.
-
-    Prototype: mean over reference embeddings, then L2-normalize.
-    """
-
-    if style_ref_clip is None:
-        return None
-    if not isinstance(style_ref_clip, torch.Tensor) or style_ref_clip.ndim != 2 or int(style_ref_clip.shape[0]) < 1:
-        return None
-    proto = style_ref_clip.float().mean(dim=0)
-    proto = proto / (proto.norm(p=2) + 1e-8)
-    return proto
-
-
-def _clip_dir_similarity(*, gen_clip: torch.Tensor, src_clip: torch.Tensor, proto_clip: torch.Tensor) -> torch.Tensor:
-    """CLIP-DIR similarity per sample.
-
-    Δ_gen = E_gen - E_src
-    Δ_tgt = E_proto - E_src
-    score = cos(Δ_gen, Δ_tgt)
-    """
-
-    delta_gen = gen_clip - src_clip
-    delta_tgt = proto_clip.unsqueeze(0) - src_clip
-    return F.cosine_similarity(delta_gen, delta_tgt, dim=-1, eps=1e-8)
+def _to_lpips_input(img01: torch.Tensor) -> torch.Tensor:
+    # lpips expects [-1,1]
+    return img01 * 2.0 - 1.0
 
 
 def _load_lpips(device: torch.device):
@@ -457,168 +371,6 @@ def _fmt_metric(x: Optional[float]) -> str:
         return "NA"
 
 
-def _load_image_tensor01(path: Path, size: int) -> torch.Tensor:
-    from PIL import Image
-    import torchvision.transforms as T
-
-    img = Image.open(path).convert("RGB").resize((size, size))
-    return T.ToTensor()(img)
-
-
-def _resolve_reuse_gen_dirs(reuse_gen_dir: Path) -> Tuple[Path, Path]:
-    """Resolve A2B/B2A directories from a user-supplied reuse_gen_dir.
-
-    Accepts either:
-    - .../gen (containing A2B/ and B2A/)
-    - ... (containing gen/A2B and gen/B2A)
-    """
-
-    reuse_gen_dir = Path(reuse_gen_dir)
-    cand1_a = reuse_gen_dir / "A2B"
-    cand1_b = reuse_gen_dir / "B2A"
-    if cand1_a.exists() and cand1_b.exists():
-        return cand1_a, cand1_b
-
-    cand2_a = reuse_gen_dir / "gen" / "A2B"
-    cand2_b = reuse_gen_dir / "gen" / "B2A"
-    if cand2_a.exists() and cand2_b.exists():
-        return cand2_a, cand2_b
-
-    raise FileNotFoundError(
-        "Could not find generated image folders. Expected either '{reuse}/A2B'+'{reuse}/B2A' "
-        "or '{reuse}/gen/A2B'+'{reuse}/gen/B2A'. (reuse={reuse})".format(reuse=str(reuse_gen_dir))
-    )
-
-
-def _find_gen_image_for_src(gen_dir: Path, src_path: Path, direction: str) -> Optional[Path]:
-    """Find generated image path for a given source image.
-
-    Default naming (from this repo): {src_stem}_{direction}.png
-    We'll also accept any extension under gen_dir that matches this stem prefix.
-    """
-
-    expected = gen_dir / f"{src_path.stem}_{direction}.png"
-    if expected.exists():
-        return expected
-
-    # Fallback: any file with same prefix.
-    prefix = f"{src_path.stem}_{direction}"
-    for ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
-        p = gen_dir / f"{prefix}{ext}"
-        if p.exists():
-            return p
-    return None
-
-
-@torch.no_grad()
-def evaluate_direction_from_existing_gen(
-    *,
-    direction: str,
-    src_paths: Sequence[Path],
-    gen_dir: Path,
-    device: torch.device,
-    cfg: EvalConfig,
-    src_root: Optional[Path] = None,
-    gen_root: Optional[Path] = None,
-    lpips_fn: Any = None,
-    clip_model: Any = None,
-    clip_processor: Any = None,
-    style_ref_clip: Optional[torch.Tensor] = None,
-) -> List[Dict[str, Any]]:
-    """Compute metrics using pre-generated images on disk.
-
-    Pairs src->gen by filename convention: {src_stem}_{direction}.png under gen_dir.
-    """
-
-    _require(direction in ("A2B", "B2A"), "direction must be A2B or B2A")
-    gen_dir = Path(gen_dir)
-    _require(gen_dir.exists(), f"gen_dir not found: {gen_dir}")
-
-    # Resolve pairs
-    pairs: List[Tuple[Path, Path]] = []
-    missing = 0
-    for p in src_paths:
-        gp = _find_gen_image_for_src(gen_dir, Path(p), direction)
-        if gp is None:
-            missing += 1
-            continue
-        pairs.append((Path(p), gp))
-
-    if missing > 0:
-        print(f"[warn] {direction}: missing {missing} generated images in {gen_dir}")
-    if not pairs:
-        return []
-
-    # style metric (CLIP-DIR): prototype from reference embeddings.
-    style_proto = _compute_style_proto(style_ref_clip)
-    if style_proto is not None:
-        style_proto = style_proto.to(device, dtype=torch.float32)
-
-    rows_out: List[Dict[str, Any]] = []
-    bs = max(1, int(getattr(cfg, "batch_size", 8)))
-
-    # Pre-load transforms for PIL conversion
-    import torchvision.transforms as T
-
-    for start in range(0, len(pairs), bs):
-        batch_pairs = pairs[start : start + bs]
-        src_batch01 = torch.stack([_load_image_tensor01(sp, cfg.image_size) for sp, _ in batch_pairs], dim=0).to(device)
-        gen_batch01 = torch.stack([_load_image_tensor01(gp, cfg.image_size) for _, gp in batch_pairs], dim=0).to(device)
-
-        content_lpips_vals: List[Optional[float]] = [None] * len(batch_pairs)
-        content_clip_vals: List[Optional[float]] = [None] * len(batch_pairs)
-        style_clip_vals: List[Optional[float]] = [None] * len(batch_pairs)
-
-        if lpips_fn is not None:
-            d = lpips_fn(_to_lpips_input(gen_batch01.float()), _to_lpips_input(src_batch01.float()))
-            content_lpips_vals = d.view(-1).detach().cpu().float().tolist()
-
-        gen_clip = None
-        if clip_model is not None and clip_processor is not None:
-            pil_gen = [T.ToPILImage()(gen_batch01[i].detach().float().cpu()) for i in range(gen_batch01.shape[0])]
-            pil_src = [T.ToPILImage()(src_batch01[i].detach().float().cpu()) for i in range(src_batch01.shape[0])]
-            with torch.no_grad():
-                inputs_gen = clip_processor(images=pil_gen, return_tensors="pt").to(device)
-                out_gen = clip_model.get_image_features(**inputs_gen)
-                gen_clip = _extract_clip_embeddings(out_gen).to(device, dtype=torch.float32)
-                if gen_clip.ndim == 1:
-                    gen_clip = gen_clip.unsqueeze(0)
-                gen_clip = gen_clip / (gen_clip.norm(p=2, dim=-1, keepdim=True) + 1e-8)
-
-                inputs_src = clip_processor(images=pil_src, return_tensors="pt").to(device)
-                out_src = clip_model.get_image_features(**inputs_src)
-                src_clip = _extract_clip_embeddings(out_src).to(device, dtype=torch.float32)
-                if src_clip.ndim == 1:
-                    src_clip = src_clip.unsqueeze(0)
-                src_clip = src_clip / (src_clip.norm(p=2, dim=-1, keepdim=True) + 1e-8)
-
-            content_clip_vals = F.cosine_similarity(gen_clip, src_clip).detach().cpu().float().tolist()
-
-            if style_proto is not None and gen_clip is not None:
-                try:
-                    sim_dir = _clip_dir_similarity(gen_clip=gen_clip, src_clip=src_clip, proto_clip=style_proto)
-                    style_clip_vals = sim_dir.detach().cpu().float().tolist()
-                except Exception:
-                    style_clip_vals = [None] * len(batch_pairs)
-
-        for i, (sp, gp) in enumerate(batch_pairs):
-            row = {
-                "direction": direction,
-                "src_path": _relpath_or_str(sp, src_root) if cfg.compact_paths else str(sp),
-                "src_path_abs": str(sp),
-                "src_image": str(sp.name),
-                "gen_path": (_relpath_or_str(gp, gen_root) if (cfg.compact_paths and gen_root is not None) else str(gp)),
-                "gen_image": str(gp.name),
-                "content_lpips": content_lpips_vals[i] if content_lpips_vals else None,
-                "content_clip": content_clip_vals[i] if content_clip_vals else None,
-                "style_clip": style_clip_vals[i] if style_clip_vals else None,
-                "fid": None,
-            }
-            rows_out.append(row)
-
-    return rows_out
-
-
 def _save_side_by_side_with_metrics(
     *,
     out_path: Path,
@@ -627,10 +379,11 @@ def _save_side_by_side_with_metrics(
     direction: str,
     index: int,
     content_lpips: Optional[float],
+    style_lpips: Optional[float],
     content_clip: Optional[float],
-    fid: Optional[float],
+    style_clip: Optional[float],
 ) -> None:
-    """Save a single PNG: left=source, right=generated, with header + 3x1 metric table."""
+    """Save a single PNG: left=source, right=generated, with header + 2x2 metric table."""
 
     from PIL import Image, ImageDraw, ImageFont
     import torchvision.transforms as T
@@ -660,19 +413,18 @@ def _save_side_by_side_with_metrics(
 
     top = header_h + h
     draw.rectangle([0, top, w * 2 - 1, top + table_h - 1], outline=(0, 0, 0), width=1)
-
-    # 3 rows, 1 column (across full width)
-    ch = table_h / 3
-    draw.line([0, top + ch, w * 2, top + ch], fill=(0, 0, 0), width=1)
-    draw.line([0, top + 2 * ch, w * 2, top + 2 * ch], fill=(0, 0, 0), width=1)
+    draw.line([w, top, w, top + table_h], fill=(0, 0, 0), width=1)
+    draw.line([0, top + table_h / 2, w * 2, top + table_h / 2], fill=(0, 0, 0), width=1)
 
     cells = [
         (0, 0, "LPIPS content", _fmt_metric(content_lpips)),
+        (1, 0, "LPIPS style", _fmt_metric(style_lpips)),
         (0, 1, "CLIP content", _fmt_metric(content_clip)),
-        (0, 2, "FID", _fmt_metric(fid)),
+        (1, 1, "CLIP style", _fmt_metric(style_clip)),
     ]
     pad = 6
-    cw = w * 2
+    cw = w
+    ch = table_h / 2
     for cx, cy, label, val in cells:
         x0 = cx * cw
         y0 = top + cy * ch
@@ -693,47 +445,44 @@ def _summarize_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "count": len(rows),
         "content_lpips": avg("content_lpips"),
+        "style_lpips": avg("style_lpips"),
         "content_clip": avg("content_clip"),
         "style_clip": avg("style_clip"),
-        "fid": avg("fid"),
     }
 
 
 def evaluate_direction(
     direction: str,
     src_paths: Sequence[Path],
+    ref_paths: Sequence[Path],
     gen: nn.Module,
     vae: nn.Module,
     device: torch.device,
     latents_scaled: bool,
     vae_scaling_factor: float,
     latent_divisor: float,
+    out_writer: csv.DictWriter,
     out_dir: Path,
     cfg: EvalConfig,
     save_images: bool,
     src_root: Optional[Path] = None,
     gen_root: Optional[Path] = None,
-    lpips_fn: Any = None,
-    clip_model: Any = None,
-    clip_processor: Any = None,
-    style_ref_clip: Optional[torch.Tensor] = None,
 ) -> List[Dict[str, Any]]:
     _require(direction in ("A2B", "B2A"), "direction must be A2B or B2A")
 
     if cfg.max_src_samples > 0:
         src_paths = src_paths[: min(len(src_paths), int(cfg.max_src_samples))]
 
-    # Save generated images for FID calculation under out_dir/gen/{direction}
-    # (also used as the right-side image for composites).
-    gen_dir = out_dir / "gen" / direction
-    gen_dir.mkdir(parents=True, exist_ok=True)
+    images_dir = out_dir / "images" / direction
+    if save_images:
+        images_dir.mkdir(parents=True, exist_ok=True)
 
-    if lpips_fn is None:
-        lpips_fn = None if cfg.disable_lpips else _load_lpips(device)
+    lpips_fn = None if cfg.disable_lpips else _load_lpips(device)
     if (not cfg.disable_lpips) and lpips_fn is None:
         print("[warn] LPIPS not available. Install: pip install lpips")
 
-    if (not cfg.disable_clip) and (clip_model is None or clip_processor is None):
+    clip_model, clip_processor = (None, None)
+    if not cfg.disable_clip:
         clip_model, clip_processor, clip_err = _load_clip_with_cfg(
             device=device,
             model_id=str(cfg.clip_model_id or "openai/clip-vit-base-patch32"),
@@ -750,21 +499,47 @@ def evaluate_direction(
                     + (clip_err or "")
                     + " (If offline, pre-download/cached model or set --clip_local_files_only)"
                 )
-            clip_model, clip_processor = None, None
+
+    cache_root = Path(cfg.cache_dir)
+    cache_root.mkdir(parents=True, exist_ok=True)
+    cache_key = f"{direction}_{_hash_dir(Path(ref_paths[0]).parents[1] if ref_paths else out_dir)}_{len(ref_paths)}_{cfg.image_size}_{cfg.max_ref_cache}"
+    cache_file = cache_root / f"ref_clip_{hashlib.md5(cache_key.encode('utf-8')).hexdigest()[:10]}.pt"
+
+    ref_clip_cpu: Optional[torch.Tensor] = None
+    if (not cfg.disable_clip) and clip_model is not None and clip_processor is not None and ref_paths:
+        if cache_file.exists() and not cfg.force_regen_cache:
+            try:
+                ref_clip_cpu = torch.load(cache_file, map_location="cpu")
+            except Exception:
+                ref_clip_cpu = None
+        if ref_clip_cpu is None:
+            ref_clip_cpu = _compute_ref_clip_matrix(
+                ref_paths,
+                clip_model=clip_model,
+                clip_processor=clip_processor,
+                device=device,
+                image_size=cfg.image_size,
+                max_ref_cache=cfg.max_ref_cache,
+            )
+            if ref_clip_cpu is not None:
+                torch.save(ref_clip_cpu, cache_file)
+
+    ref_clip_gpu = ref_clip_cpu.to(device, dtype=torch.float32) if ref_clip_cpu is not None else None
 
     rows_out: List[Dict[str, Any]] = []
     bs = max(1, int(cfg.batch_size))
-
-    # style metric (CLIP-DIR): prototype from reference embeddings.
-    style_proto = _compute_style_proto(style_ref_clip)
-    if style_proto is not None:
-        style_proto = style_proto.to(device, dtype=torch.float32)
 
     amp_ctx = nullcontext()
     if device.type == "cuda" and cfg.amp_bf16:
         amp_ctx = torch.autocast("cuda", dtype=torch.bfloat16)
 
+    from PIL import Image
     import torchvision.transforms as T
+
+    # Pre-load a small list of reference tensors for LPIPS style (on-the-fly per image)
+    ref_for_lpips: List[Path] = list(ref_paths)
+    if cfg.max_ref_compare > 0:
+        ref_for_lpips = ref_for_lpips[: min(len(ref_for_lpips), int(cfg.max_ref_compare))]
 
     for start in range(0, len(src_paths), bs):
         batch_paths = src_paths[start : start + bs]
@@ -797,10 +572,9 @@ def evaluate_direction(
         # src in [0,1] for metrics
         src01 = (src_batch / 2 + 0.5).clamp(0, 1)
 
-        # content LPIPS + content CLIP
+        # content LPIPS + clip_content
         content_lpips_vals: List[Optional[float]] = [None] * len(batch_paths)
         content_clip_vals: List[Optional[float]] = [None] * len(batch_paths)
-        style_clip_vals: List[Optional[float]] = [None] * len(batch_paths)
 
         if lpips_fn is not None:
             d = lpips_fn(_to_lpips_input(img_gen.float()), _to_lpips_input(src01.float()))
@@ -829,36 +603,69 @@ def evaluate_direction(
 
             content_clip_vals = F.cosine_similarity(gen_clip, src_clip).detach().cpu().float().tolist()
 
-            if style_proto is not None and gen_clip is not None:
-                try:
-                    sim_dir = _clip_dir_similarity(gen_clip=gen_clip, src_clip=src_clip, proto_clip=style_proto)
-                    style_clip_vals = sim_dir.detach().cpu().float().tolist()
-                except Exception:
-                    style_clip_vals = [None] * len(batch_paths)
-
-        # per-image outputs
+        # per-image style metrics
         for i, p in enumerate(batch_paths):
             gen_rel = f"{p.stem}_{direction}.png"
-            gen_path = gen_dir / gen_rel
+            gen_path = images_dir / gen_rel
 
-            # Always save generated image (needed for FID and optional composites).
-            try:
-                T.ToPILImage()(img_gen[i].detach().float().cpu()).save(gen_path)
-            except Exception:
-                pass
+            style_lpips_val: Optional[float] = None
+            style_clip_val: Optional[float] = None
+
+            if lpips_fn is not None and ref_for_lpips:
+                # average LPIPS to a subset of target refs
+                # (smaller is better: closer to target style manifold)
+                lpips_chunk = 8
+                all_dists: List[torch.Tensor] = []
+                for cs in range(0, len(ref_for_lpips), lpips_chunk):
+                    ce = min(cs + lpips_chunk, len(ref_for_lpips))
+                    chunk = ref_for_lpips[cs:ce]
+                    ref_imgs = []
+                    for rp in chunk:
+                        img = Image.open(rp).convert("RGB").resize((cfg.image_size, cfg.image_size))
+                        ref_imgs.append(T.ToTensor()(img))
+                    ref_batch01 = torch.stack(ref_imgs, dim=0).to(device)
+                    gen01 = img_gen[i : i + 1].float().expand(ref_batch01.shape[0], -1, -1, -1)
+                    d = lpips_fn(_to_lpips_input(gen01), _to_lpips_input(ref_batch01))
+                    all_dists.append(d.detach().view(-1))
+                if all_dists:
+                    style_lpips_val = float(torch.cat(all_dists).mean().detach().cpu().item())
+
+            if ref_clip_gpu is not None and gen_clip is not None:
+                # mean cosine similarity to target ref set (bigger is better)
+                g = gen_clip[i : i + 1]
+                sims = torch.matmul(g, ref_clip_gpu.t())
+                style_clip_val = float(sims.mean().detach().cpu().item())
+
+            if save_images:
+                try:
+                    _save_side_by_side_with_metrics(
+                        out_path=gen_path,
+                        src01=src01[i],
+                        gen01=img_gen[i],
+                        direction=direction,
+                        index=int(start + i + 1),
+                        content_lpips=(content_lpips_vals[i] if content_lpips_vals else None),
+                        style_lpips=style_lpips_val,
+                        content_clip=(content_clip_vals[i] if content_clip_vals else None),
+                        style_clip=style_clip_val,
+                    )
+                except Exception:
+                    pass
 
             row = {
                 "direction": direction,
                 "src_path": _relpath_or_str(p, src_root) if cfg.compact_paths else str(p),
-                "src_path_abs": str(p),
                 "src_image": str(p.name),
-                "gen_path": (_relpath_or_str(gen_path, gen_root) if (cfg.compact_paths and gen_root is not None) else str(gen_path)),
-                "gen_image": str(gen_path.name),
+                "gen_path": (
+                    _relpath_or_str(gen_path, gen_root) if (cfg.compact_paths and save_images) else (str(gen_path) if save_images else "")
+                ),
+                "gen_image": str(gen_path.name) if save_images else "",
                 "content_lpips": content_lpips_vals[i] if content_lpips_vals else None,
+                "style_lpips": style_lpips_val,
                 "content_clip": content_clip_vals[i] if content_clip_vals else None,
-                "style_clip": style_clip_vals[i] if style_clip_vals else None,
-                "fid": None,
+                "style_clip": style_clip_val,
             }
+            out_writer.writerow(row)
             rows_out.append(row)
 
     return rows_out
@@ -881,30 +688,13 @@ def main() -> None:
     parser.add_argument("--testA", type=str, default="", help="Directory of domain A test images (overrides config)")
     parser.add_argument("--testB", type=str, default="", help="Directory of domain B test images (overrides config)")
 
-    parser.add_argument(
-        "--fid_statsA",
-        type=str,
-        default="",
-        help="Path to fid_stats.npz for domain A reference set (default: {testA}/fid_stats.npz)",
-    )
-    parser.add_argument(
-        "--fid_statsB",
-        type=str,
-        default="",
-        help="Path to fid_stats.npz for domain B reference set (default: {testB}/fid_stats.npz)",
-    )
-
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--max_src_samples", type=int, default=0)
-
-    # style_clip settings: compare each generated image to a cached reference set (target domain).
-    # - max_ref_cache: how many reference images to embed+cache (0 disables style_clip).
-    # - max_ref_compare: how many cached refs to compare per image (<=0 means all).
-    parser.add_argument("--max_ref_cache", type=int, default=256, help="Reference cache size for style_clip (0 disables)")
-    parser.add_argument("--max_ref_compare", type=int, default=50, help="How many cached refs to compare per image for style_clip (<=0 means all)")
-    parser.add_argument("--cache_dir", type=str, default="outputs/eval_cache", help="Cache directory for style_clip reference embeddings")
-    parser.add_argument("--force_regen_cache", action="store_true", help="Recompute style_clip reference cache even if exists")
+    parser.add_argument("--max_ref_cache", type=int, default=256)
+    parser.add_argument("--max_ref_compare", type=int, default=50)
+    parser.add_argument("--cache_dir", type=str, default="outputs/eval_cache")
+    parser.add_argument("--force_regen_cache", action="store_true")
 
     parser.add_argument("--disable_lpips", action="store_true")
     parser.add_argument("--disable_clip", action="store_true")
@@ -939,16 +729,6 @@ def main() -> None:
         "--save_images",
         action="store_true",
         help="Save generated images under {out_dir}/{checkpoint_stem}/images/{A2B|B2A}",
-    )
-
-    parser.add_argument(
-        "--reuse_gen_dir",
-        type=str,
-        default="",
-        help=(
-            "Use existing generated images (skip model+VAE inference). "
-            "Point to a folder containing A2B/ and B2A/ (or a folder containing gen/A2B and gen/B2A)."
-        ),
     )
 
     # Optional VAE override (otherwise read from checkpoint cfg.visualization)
@@ -994,7 +774,6 @@ def main() -> None:
     _require(ckpt_path.exists(), f"checkpoint not found: {ckpt_path}")
 
     payload = _load_ckpt(ckpt_path)
-    _require("cfg" in payload and isinstance(payload.get("cfg"), dict), "Checkpoint missing key: 'cfg' (expected current training format)")
     cfg_saved = payload.get("cfg", {})
 
     # Pull model hyperparams from saved cfg when possible
@@ -1017,8 +796,6 @@ def main() -> None:
         device_str = "cpu"
     device = torch.device(device_str)
 
-    _require("G" in payload and "F" in payload, "Checkpoint missing keys: expected 'G' and 'F' (expected current training format)")
-
     G = ResnetGenerator(
         in_ch=in_ch,
         out_ch=out_ch,
@@ -1034,38 +811,29 @@ def main() -> None:
         out_activation=out_activation,
     ).to(device)
 
+    _require("G" in payload and "F" in payload, "Checkpoint missing keys: expected 'G' and 'F'")
     G.load_state_dict(payload["G"], strict=True)
     Fnet.load_state_dict(payload["F"], strict=True)
     G.eval()
     Fnet.eval()
 
-    reuse_gen_dir_raw = str(getattr(args, "reuse_gen_dir", "") or "").strip()
-    reuse_gen_dir = Path(reuse_gen_dir_raw) if reuse_gen_dir_raw else None
+    # Resolve VAE: CLI override > YAML visualization > checkpoint visualization
+    vae_model = str(args.vae_model).strip() or str(vis_cfg_from_file.get("vae_model_name_or_path", "")).strip() or str(
+        vis_cfg.get("vae_model_name_or_path", "")
+    ).strip()
+    _require(vae_model != "", "VAE model is not set. Provide --vae_model or set visualization.vae_model_name_or_path in training config")
 
-    vae = None
-    vae_model = ""
-    vae_sub = None
+    vae_sub = str(args.vae_subfolder).strip() or str(vis_cfg_from_file.get("vae_subfolder", "")).strip() or str(
+        vis_cfg.get("vae_subfolder", "")
+    ).strip()
+    vae_sub = vae_sub if vae_sub else None
+
     vae_scaling_factor = float(args.vae_scaling_factor)
-    if reuse_gen_dir is None:
-        # Resolve VAE: CLI override > YAML visualization > checkpoint visualization
-        vae_model = str(args.vae_model).strip() or str(vis_cfg_from_file.get("vae_model_name_or_path", "")).strip() or str(
-            vis_cfg.get("vae_model_name_or_path", "")
-        ).strip()
-        _require(
-            vae_model != "",
-            "VAE model is not set. Provide --vae_model or set visualization.vae_model_name_or_path in training config",
-        )
+    if isinstance(vis_cfg.get("vae_scaling_factor"), (float, int)) and not str(args.vae_model).strip():
+        # use checkpoint's vis scaling factor when not overriding vae_model explicitly
+        vae_scaling_factor = float(vis_cfg.get("vae_scaling_factor"))
 
-        vae_sub_raw = str(args.vae_subfolder).strip() or str(vis_cfg_from_file.get("vae_subfolder", "")).strip() or str(
-            vis_cfg.get("vae_subfolder", "")
-        ).strip()
-        vae_sub = vae_sub_raw if vae_sub_raw else None
-
-        if isinstance(vis_cfg.get("vae_scaling_factor"), (float, int)) and not str(args.vae_model).strip():
-            # use checkpoint's vis scaling factor when not overriding vae_model explicitly
-            vae_scaling_factor = float(vis_cfg.get("vae_scaling_factor"))
-
-        vae = _load_vae(vae_model, vae_sub, device)
+    vae = _load_vae(vae_model, vae_sub, device)
 
     testA = Path(testA_raw)
     testB = Path(testB_raw)
@@ -1086,6 +854,7 @@ def main() -> None:
     max_src_samples = int(eval_cfg.get("max_src_samples", args.max_src_samples))
     max_ref_cache = int(eval_cfg.get("max_ref_cache", args.max_ref_cache))
     max_ref_compare = int(eval_cfg.get("max_ref_compare", args.max_ref_compare))
+
     cache_dir = str(eval_cfg.get("cache_dir", args.cache_dir)).strip() or str(args.cache_dir)
     force_regen_cache = bool(eval_cfg.get("force_regen_cache", False)) or bool(args.force_regen_cache)
     save_images = bool(eval_cfg.get("save_images", False)) or bool(args.save_images)
@@ -1107,7 +876,7 @@ def main() -> None:
         max_src_samples=max_src_samples,
         max_ref_cache=max_ref_cache,
         max_ref_compare=max_ref_compare,
-        cache_dir=cache_dir or "outputs/eval_cache",
+        cache_dir=cache_dir,
         force_regen_cache=force_regen_cache,
         disable_lpips=disable_lpips,
         disable_clip=disable_clip,
@@ -1120,224 +889,56 @@ def main() -> None:
         device=device_str,
     )
 
-    # Pre-load LPIPS/CLIP once to avoid duplicate model loads/prints for A2B and B2A.
-    lpips_fn = None if cfg_eval.disable_lpips else _load_lpips(device)
-    clip_model, clip_processor = (None, None)
-    if not cfg_eval.disable_clip:
-        clip_model, clip_processor, clip_err = _load_clip_with_cfg(
-            device=device,
-            model_id=str(cfg_eval.clip_model_id or "openai/clip-vit-base-patch32"),
-            cache_dir=str(cfg_eval.clip_cache_dir or ""),
-            local_files_only=bool(cfg_eval.clip_local_files_only),
-            use_safetensors=bool(cfg_eval.clip_use_safetensors),
-        )
-        if clip_model is None:
-            if clip_err and "not installed" in clip_err:
-                print("[warn] CLIP not available: transformers is missing. Install: pip install transformers")
-            else:
-                print(
-                    "[warn] CLIP disabled: model could not be loaded. "
-                    + (clip_err or "")
-                    + " (If offline, pre-download/cached model or set --clip_local_files_only)"
-                )
-            clip_model, clip_processor = None, None
+    with open(metrics_csv, "w", newline="", encoding="utf-8") as f:
+        columns = [
+            "direction",
+            "src_path",
+            "src_image",
+            "gen_path",
+            "gen_image",
+            "content_lpips",
+            "style_lpips",
+            "content_clip",
+            "style_clip",
+        ]
+        writer = csv.DictWriter(f, fieldnames=columns)
+        writer.writeheader()
 
-    src_root_for_rows = _common_root([testA, testB]) if cfg_eval.compact_paths else None
-    gen_root_for_rows = (out_dir / "gen") if cfg_eval.compact_paths else None
-
-    style_ref_a = (
-        _load_or_build_clip_ref_cache(
-            ref_dir=testA,
-            ref_paths=srcA,
-            clip_model=clip_model,
-            clip_processor=clip_processor,
-            device=device,
-            cfg=cfg_eval,
-        )
-        if (clip_model is not None and clip_processor is not None and (not cfg_eval.disable_clip))
-        else None
-    )
-    style_ref_b = (
-        _load_or_build_clip_ref_cache(
-            ref_dir=testB,
-            ref_paths=srcB,
-            clip_model=clip_model,
-            clip_processor=clip_processor,
-            device=device,
-            cfg=cfg_eval,
-        )
-        if (clip_model is not None and clip_processor is not None and (not cfg_eval.disable_clip))
-        else None
-    )
-
-    if reuse_gen_dir is not None:
-        a2b_dir, b2a_dir = _resolve_reuse_gen_dirs(reuse_gen_dir)
-        rows_a2b = evaluate_direction_from_existing_gen(
-            direction="A2B",
-            src_paths=srcA,
-            gen_dir=a2b_dir,
-            device=device,
-            cfg=cfg_eval,
-            src_root=src_root_for_rows,
-            gen_root=(reuse_gen_dir if cfg_eval.compact_paths else None),
-            lpips_fn=lpips_fn,
-            clip_model=clip_model,
-            clip_processor=clip_processor,
-            style_ref_clip=style_ref_b,
-        )
-        rows_b2a = evaluate_direction_from_existing_gen(
-            direction="B2A",
-            src_paths=srcB,
-            gen_dir=b2a_dir,
-            device=device,
-            cfg=cfg_eval,
-            src_root=src_root_for_rows,
-            gen_root=(reuse_gen_dir if cfg_eval.compact_paths else None),
-            lpips_fn=lpips_fn,
-            clip_model=clip_model,
-            clip_processor=clip_processor,
-            style_ref_clip=style_ref_a,
-        )
-    else:
-        _require(vae is not None, "Internal error: VAE is required when not reusing generated images")
         rows_a2b = evaluate_direction(
             direction="A2B",
             src_paths=srcA,
+            ref_paths=srcB,
             gen=G,
             vae=vae,
             device=device,
             latents_scaled=latents_scaled,
             vae_scaling_factor=vae_scaling_factor,
             latent_divisor=latent_divisor,
+            out_writer=writer,
             out_dir=out_dir,
             cfg=cfg_eval,
             save_images=save_images,
-            src_root=src_root_for_rows,
-            gen_root=gen_root_for_rows,
-            lpips_fn=lpips_fn,
-            clip_model=clip_model,
-            clip_processor=clip_processor,
-            style_ref_clip=style_ref_b,
+            src_root=_common_root([testA, testB]) if cfg_eval.compact_paths else None,
+            gen_root=(out_dir / "images") if cfg_eval.compact_paths else None,
         )
 
         rows_b2a = evaluate_direction(
             direction="B2A",
             src_paths=srcB,
+            ref_paths=srcA,
             gen=Fnet,
             vae=vae,
             device=device,
             latents_scaled=latents_scaled,
             vae_scaling_factor=vae_scaling_factor,
             latent_divisor=latent_divisor,
+            out_writer=writer,
             out_dir=out_dir,
             cfg=cfg_eval,
             save_images=save_images,
-            src_root=src_root_for_rows,
-            gen_root=gen_root_for_rows,
-            lpips_fn=lpips_fn,
-            clip_model=clip_model,
-            clip_processor=clip_processor,
-            style_ref_clip=style_ref_a,
+            src_root=_common_root([testA, testB]) if cfg_eval.compact_paths else None,
+            gen_root=(out_dir / "images") if cfg_eval.compact_paths else None,
         )
-
-    # ----------------- FID: compute dataset stats for generated images and compare to precomputed refs -----------------
-    statsA_path = Path(str(args.fid_statsA).strip()) if str(args.fid_statsA).strip() else (testA / fid_utils.DEFAULT_STATS_NAME)
-    statsB_path = Path(str(args.fid_statsB).strip()) if str(args.fid_statsB).strip() else (testB / fid_utils.DEFAULT_STATS_NAME)
-
-    fid_a2b: Optional[float] = None
-    fid_b2a: Optional[float] = None
-
-    fid_dir = out_dir / "fid"
-    fid_dir.mkdir(parents=True, exist_ok=True)
-
-    def _compute_fid_for(direction: str, gen_folder: Path, ref_stats: Path) -> Optional[float]:
-        if not ref_stats.exists():
-            print(f"[warn] FID reference stats not found: {ref_stats}. Run: python precompute_fid_vectors.py {ref_stats.parent}")
-            return None
-
-        mu_ref, sigma_ref = fid_utils.load_stats(ref_stats)
-        mu_gen, sigma_gen, count, dim = fid_utils.compute_folder_mu_sigma(
-            gen_folder,
-            device=str(device.type),
-            batch_size=max(1, int(cfg_eval.batch_size)),
-            num_workers=4,
-            mode="clean",
-        )
-        np.savez(
-            fid_dir / f"{direction}_gen_stats.npz",
-            mu=np.asarray(mu_gen, dtype=np.float64),
-            sigma=np.asarray(sigma_gen, dtype=np.float64),
-            count=int(count),
-            dim=int(dim),
-            gen_dir=str(gen_folder),
-            ref_stats=str(ref_stats),
-        )
-        return float(fid_utils.frechet_distance(mu_gen, sigma_gen, mu_ref, sigma_ref))
-
-    if reuse_gen_dir is not None:
-        a2b_dir, b2a_dir = _resolve_reuse_gen_dirs(reuse_gen_dir)
-        fid_a2b = _compute_fid_for("A2B", a2b_dir, statsB_path)
-        fid_b2a = _compute_fid_for("B2A", b2a_dir, statsA_path)
-    else:
-        fid_a2b = _compute_fid_for("A2B", out_dir / "gen" / "A2B", statsB_path)
-        fid_b2a = _compute_fid_for("B2A", out_dir / "gen" / "B2A", statsA_path)
-
-    for r in rows_a2b:
-        r["fid"] = fid_a2b
-    for r in rows_b2a:
-        r["fid"] = fid_b2a
-
-    # ----------------- Write metrics.csv (with FID column) -----------------
-    columns = [
-        "direction",
-        "src_path",
-        "src_image",
-        "gen_path",
-        "gen_image",
-        "content_lpips",
-        "content_clip",
-        "style_clip",
-        "fid",
-    ]
-    with open(metrics_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
-        writer.writeheader()
-        for r in rows_a2b + rows_b2a:
-            writer.writerow(r)
-
-    # ----------------- Render composite images (after FID is known) -----------------
-    if save_images:
-        images_root = out_dir / "images"
-        for direction, rows, fid_val in (
-            ("A2B", rows_a2b, fid_a2b),
-            ("B2A", rows_b2a, fid_b2a),
-        ):
-            out_img_dir = images_root / direction
-            out_img_dir.mkdir(parents=True, exist_ok=True)
-            for idx, r in enumerate(rows, start=1):
-                try:
-                    src_abs = Path(str(r.get("src_path_abs", "")).strip() or str(r.get("src_path", "")).strip())
-                    gen_abs = Path(out_dir / "gen" / direction / str(r.get("gen_image", "")).strip())
-                    if not gen_abs.exists():
-                        # fallback: try gen_path
-                        gen_abs = Path(str(r.get("gen_path", "")).strip())
-
-                    src01 = _load_image_tensor01(src_abs, cfg_eval.image_size)
-                    gen01 = _load_image_tensor01(gen_abs, cfg_eval.image_size)
-                    out_path = out_img_dir / str(r.get("gen_image", f"{idx:06d}_{direction}.png"))
-
-                    _save_side_by_side_with_metrics(
-                        out_path=out_path,
-                        src01=src01,
-                        gen01=gen01,
-                        direction=direction,
-                        index=int(idx),
-                        content_lpips=r.get("content_lpips"),
-                        content_clip=r.get("content_clip"),
-                        fid=fid_val,
-                    )
-                except Exception:
-                    pass
 
     summary = {
         "checkpoint": str(ckpt_path),
@@ -1346,7 +947,7 @@ def main() -> None:
         "testB": str(testB),
         "compact_paths": bool(cfg_eval.compact_paths),
         "src_root": str(_common_root([testA, testB])) if cfg_eval.compact_paths else "",
-        "gen_root": str(out_dir / "gen") if cfg_eval.compact_paths else "",
+        "gen_root": str(out_dir / "images") if cfg_eval.compact_paths else "",
         "latents_scaled": latents_scaled,
         "latent_divisor": latent_divisor,
         "vae_model": vae_model,
@@ -1363,7 +964,7 @@ def main() -> None:
             json.dump(
                 {
                     "src_root": str(_common_root([testA, testB]) or ""),
-                    "gen_root": str(out_dir / "gen"),
+                    "gen_root": str(out_dir / "images"),
                 },
                 f,
                 ensure_ascii=False,

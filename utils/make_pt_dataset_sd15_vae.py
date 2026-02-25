@@ -153,7 +153,9 @@ def encode_dir_to_pt(
         with torch.no_grad():
             with autocast(enabled=amp and device.type == "cuda"):
                 # NOTE: output is *unscaled* latents (no 0.18215 scaling)
+                
                 lat = vae.encode(imgs).latent_dist.sample()  # type: ignore[attr-defined]
+                lat = lat * 0.154353
 
         lat = lat.detach().to(dtype=torch.float32).cpu()
 
@@ -171,18 +173,52 @@ def encode_dir_to_pt(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Encode dataset/trainA and dataset/trainB images independently into SD1.5 VAE latents (.pt). "
+            "Encode images into SD1.5 VAE latents (.pt). "
+            "Default mode encodes dataset_dir/{splits}. "
+            "If --in_dirs is provided, encodes arbitrary input directories instead. "
             "Output filenames follow input (same relative path, suffix .pt)."
         )
     )
-    parser.add_argument("--dataset_dir", type=str, default="dataset", help="Root dataset dir containing trainA/trainB")
-    parser.add_argument("--out_dir", type=str, default="pt_dataset", help="Output root dir containing trainA/trainB")
+    parser.add_argument(
+        "--in_dirs",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "One or more input directories. If set, this overrides --dataset_dir/--splits. "
+            "Each directory will be encoded into out_dir/<name>/..., where <name> is the input directory basename "
+            "(or the corresponding entry in --out_names if provided)."
+        ),
+    )
+    parser.add_argument(
+        "--out_names",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "Optional list of output subfolder names (same length as --in_dirs). "
+            "Example: --in_dirs data/A data/B --out_names trainA trainB"
+        ),
+    )
+
+    parser.add_argument(
+        "--dataset_dir",
+        type=str,
+        default="dataset",
+        help="(Default mode) Root dataset dir containing trainA/trainB",
+    )
+    parser.add_argument(
+        "--out_dir",
+        type=str,
+        default="pt_dataset",
+        help="Output root dir. In default mode contains trainA/trainB; in --in_dirs mode contains per-input subfolders.",
+    )
     parser.add_argument(
         "--splits",
         type=str,
         nargs="+",
         default=["trainA", "trainB"],
-        help="Which subfolders under dataset_dir to process (default: trainA trainB)",
+        help="(Default mode) Which subfolders under dataset_dir to process (default: trainA trainB)",
     )
 
     parser.add_argument(
@@ -215,11 +251,7 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    dataset_dir = Path(args.dataset_dir)
     out_root = Path(args.out_dir)
-
-    splits: List[str] = list(args.splits)
-    _require(len(splits) > 0, "--splits must be non-empty")
 
     device_str = args.device
     if device_str == "cuda" and not torch.cuda.is_available():
@@ -233,29 +265,69 @@ def main() -> None:
     print("Loading VAE...")
     vae = _load_vae(args.vae_model_name_or_path, vae_subfolder, device)
 
-    for split in splits:
-        in_dir = dataset_dir / split
-        out_dir = out_root / split
-        image_paths = _list_images(in_dir)
-        if not image_paths:
-            print(f"[warn] No images found under: {in_dir}")
-            continue
+    if args.in_dirs is not None and len(args.in_dirs) > 0:
+        in_dirs = [Path(p) for p in args.in_dirs]
 
-        print(f"Split '{split}': {len(image_paths)} images")
-        encode_dir_to_pt(
-            in_dir=in_dir,
-            image_paths=image_paths,
-            vae=vae,
-            device=device,
-            out_dir=out_dir,
-            batch_size=int(args.batch_size),
-            num_workers=int(args.num_workers),
-            resolution=args.resolution,
-            auto_resize_to_multiple_of_8=not bool(args.no_auto_resize_to_multiple_of_8),
-            amp=bool(args.amp),
-            tqdm_ncols=int(args.tqdm_ncols),
-            tqdm_bar_len=int(args.tqdm_bar_len),
-        )
+        out_names: Optional[List[str]] = None
+        if args.out_names is not None:
+            out_names = list(args.out_names)
+            _require(len(out_names) == len(in_dirs), "--out_names must have same length as --in_dirs")
+
+        for idx, in_dir in enumerate(in_dirs):
+            _require(in_dir.exists() and in_dir.is_dir(), f"Input directory not found or not a directory: {in_dir}")
+
+            out_name = (out_names[idx] if out_names is not None else in_dir.name).strip()
+            _require(len(out_name) > 0, "Output subfolder name must be non-empty")
+
+            out_dir = out_root / out_name
+            image_paths = _list_images(in_dir)
+            if not image_paths:
+                print(f"[warn] No images found under: {in_dir}")
+                continue
+
+            print(f"Input '{in_dir}' -> '{out_dir}': {len(image_paths)} images")
+            encode_dir_to_pt(
+                in_dir=in_dir,
+                image_paths=image_paths,
+                vae=vae,
+                device=device,
+                out_dir=out_dir,
+                batch_size=int(args.batch_size),
+                num_workers=int(args.num_workers),
+                resolution=args.resolution,
+                auto_resize_to_multiple_of_8=not bool(args.no_auto_resize_to_multiple_of_8),
+                amp=bool(args.amp),
+                tqdm_ncols=int(args.tqdm_ncols),
+                tqdm_bar_len=int(args.tqdm_bar_len),
+            )
+    else:
+        dataset_dir = Path(args.dataset_dir)
+        splits: List[str] = list(args.splits)
+        _require(len(splits) > 0, "--splits must be non-empty")
+
+        for split in splits:
+            in_dir = dataset_dir / split
+            out_dir = out_root / split
+            image_paths = _list_images(in_dir)
+            if not image_paths:
+                print(f"[warn] No images found under: {in_dir}")
+                continue
+
+            print(f"Split '{split}': {len(image_paths)} images")
+            encode_dir_to_pt(
+                in_dir=in_dir,
+                image_paths=image_paths,
+                vae=vae,
+                device=device,
+                out_dir=out_dir,
+                batch_size=int(args.batch_size),
+                num_workers=int(args.num_workers),
+                resolution=args.resolution,
+                auto_resize_to_multiple_of_8=not bool(args.no_auto_resize_to_multiple_of_8),
+                amp=bool(args.amp),
+                tqdm_ncols=int(args.tqdm_ncols),
+                tqdm_bar_len=int(args.tqdm_bar_len),
+            )
 
     print(f"Done. Saved to: {out_root}")
 
