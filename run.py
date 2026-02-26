@@ -117,6 +117,20 @@ def main() -> None:
     config = expand_config_templates(config)
     training_cfg = config["training"]
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Performance knobs (safe defaults for NVIDIA GPUs).
+    if device.type == "cuda":
+        allow_tf32 = bool(training_cfg.get("allow_tf32", True))
+        cudnn_benchmark = bool(training_cfg.get("cudnn_benchmark", True))
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        torch.backends.cudnn.allow_tf32 = allow_tf32
+        torch.backends.cudnn.benchmark = cudnn_benchmark
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
     console_log_path = str(training_cfg.get("console_log_path", "")).strip()
     if console_log_path:
         log_path = Path(console_log_path)
@@ -149,7 +163,6 @@ def main() -> None:
     seed = int(training_cfg.get("seed", 42))
     set_seed(seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Info] using device: {device}")
 
     dataset = create_dataset_from_config(config, device=str(device))

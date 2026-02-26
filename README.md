@@ -121,6 +121,29 @@
 
 训练总 step 数大致是 $\text{num\_epochs} \times \text{steps\_per\_epoch}$（如果从 checkpoint resume，会从 `start_epoch` 接着跑）。
 
+## 学习率衰减（按 step 而不是按 epoch）
+
+本工程支持 **按实际 step 数（batch 数）** 做学习率调度，这样当你调整 `data.epoch_size` 或 `batch_size` 后，学习率衰减仍然会按“总训练步数”自适应。
+
+计算方式：
+- `steps_per_epoch = len(dataloader)`
+- `total_steps = num_epochs * steps_per_epoch`
+- 调度器每个 batch 更新一次（step-based）。
+
+配置项（都在 `training:` 里）：
+
+```yaml
+training:
+  lr_schedule: none      # none | cosine | linear
+  warmup_steps: 0        # 前 warmup_steps 个 step 线性升 lr
+  min_lr_ratio: 0.1      # 最低学习率 = 初始学习率 * min_lr_ratio
+```
+
+说明：
+- `cosine`：warmup 后 cosine decay 到 `min_lr_ratio`。
+- `linear`：warmup 后线性衰减到 `min_lr_ratio`。
+- 训练过程会在 JSON 日志中附带 `lr_g/lr_d`，方便你画图验证是否按预期衰减。
+
 ### 把运行期打印内容保存到文件
 
 如果你希望把训练过程中终端打印的内容（包括 `[Info]/[Warn]`、epoch summary、`log_json` 行、tqdm/percent 进度输出等）单独保存到一个文件里，可以在配置里加：
@@ -149,6 +172,50 @@ training:
 说明：
 - `loss_plot_interval: 1` 表示每个 epoch 保存一次图。
 - 默认会保存到 `{outputs_dir}/loss_curve.png`；你可以改成任意路径。
+
+## 4060 Laptop 上的加速建议（优先级从高到低）
+
+1) 先确认你的 epoch 到底有多少 step
+- 每个 epoch 的 step 数是 `len(dataloader)`，而 `len(dataset)=data.epoch_size`。
+- 如果 `data.epoch_size: null`，默认会变成 `max_count * num_domains`，当数据集很大时会导致 **一个 epoch 非常长**。
+- 想让“一个 epoch 更短”用于更快迭代，最直接的方法是设置：
+
+```yaml
+data:
+  epoch_size: 4096   # 举例：每个 epoch 只采样 4096 个样本
+```
+
+2) 降低可视化频率（VAE decode 会额外花时间）
+- `visualization.every_epochs: 1` 会每个 epoch 都解码并保存网格图。
+- 如果你主要关心训练速度，先改成：
+
+```yaml
+visualization:
+  every_epochs: 10
+```
+
+3) 打印策略
+- `log_json: true` 会按 `log_interval` 打印 JSON 行（对性能影响通常不大，但会让输出变多）。
+- 你可以把 `display_interval` / `log_interval` 调大一点减少 I/O。
+
+4) GPU 侧加速开关（已支持配置）
+- 在 `training:` 里新增了这些开关（默认都为 true）：
+
+```yaml
+training:
+  allow_tf32: true
+  cudnn_benchmark: true
+  optim_fused: true
+```
+
+说明：
+- `allow_tf32`：允许 TF32（对 NVIDIA GPU 通常显著提速，数值略有差异但训练一般可接受）。
+- `cudnn_benchmark`：对固定输入 shape 的卷积网络提速。
+- `optim_fused`：启用 fused AdamW（如果 PyTorch 版本支持，会更快；不支持会自动回退）。
+
+5) torch.compile 的取舍
+- 第一个 epoch 往往会更慢（编译开销），后续才可能变快。
+- 如果你想评估真实速度，建议至少跑 2-3 个 epoch 再比较。
 
 ## 全局实验名称（自动生成输出路径）
 

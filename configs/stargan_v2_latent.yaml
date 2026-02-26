@@ -32,8 +32,14 @@ training:
   lr_d: 1.0e-4
   lr_mapping: 1.0e-6
   weight_decay: 1.0e-4
+  lr_schedule: cosine   # none | cosine | linear (step-based)
+  warmup_steps: 200
+  min_lr_ratio: 0.1
   use_amp: true
   amp_dtype: bf16
+  allow_tf32: true
+  cudnn_benchmark: true
+  optim_fused: true
   latent_scale: 0.18215
   num_workers: 0
   pin_memory: true
@@ -73,7 +79,9 @@ data:
     - cezanne
     - vangogh
   preload_to_gpu: true
-  epoch_size: null
+  # 控制每个 epoch 的样本数（从而控制 steps/epoch），用于更快迭代。
+  # 你机器上当前约 1.26s/step，想 <2min/epoch 且 batch=64 时，可先用 6144（约 96 steps）。
+  epoch_size: 6144
 
 checkpoint:
   save_dir: "{outputs_dir}/ckpt"

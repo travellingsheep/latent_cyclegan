@@ -13,6 +13,7 @@ import torch.nn.functional as nnF
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from torchvision.utils import make_grid, save_image
+import math
 
 try:
     from diffusers import AutoencoderKL
@@ -74,11 +75,25 @@ class StarGANv2Trainer:
         self.w_r1 = float(config.get("loss", {}).get("w_r1", 10.0))
         self.r1_interval = max(1, int(config.get("loss", {}).get("r1_interval", 16)))
 
+        optim_fused = bool(training_cfg.get("optim_fused", True))
+        fused_ok = self.device.type == "cuda" and optim_fused
+
+        def _adamw_kwargs() -> dict:
+            kwargs = {
+                "weight_decay": float(training_cfg.get("weight_decay", 0.0)),
+                "betas": (0.0, 0.99),
+            }
+            try:
+                if fused_ok:
+                    kwargs["fused"] = True
+            except Exception:
+                pass
+            return kwargs
+
         self.opt_d = torch.optim.AdamW(
             self.D.parameters(),
             lr=float(training_cfg["lr_d"]),
-            weight_decay=float(training_cfg.get("weight_decay", 0.0)),
-            betas=(0.0, 0.99),
+            **_adamw_kwargs(),
         )
 
         lr_ge = float(training_cfg.get("lr_g", 1.0e-4))
@@ -91,8 +106,7 @@ class StarGANv2Trainer:
         self.opt_g = torch.optim.AdamW(
             g_param_groups,
             lr=lr_ge,
-            weight_decay=float(training_cfg.get("weight_decay", 0.0)),
-            betas=(0.0, 0.99),
+            **_adamw_kwargs(),
         )
 
         self.save_dir = Path(config["checkpoint"]["save_dir"])
@@ -108,6 +122,39 @@ class StarGANv2Trainer:
         self.log_json = bool(training_cfg.get("log_json", False))
         self.num_epochs = int(training_cfg.get("num_epochs", 1))
         self.domain_names = list(config.get("data", {}).get("domains", []))
+
+        # Step-based LR schedule (optional)
+        self.global_step = 0
+        self.steps_per_epoch = int(len(self.loader))
+        self.total_steps = int(self.steps_per_epoch * self.num_epochs)
+        sched = training_cfg.get("lr_schedule", "none")
+        self.lr_schedule = str(sched).lower().strip() if sched is not None else "none"
+        self.warmup_steps = int(training_cfg.get("warmup_steps", 0))
+        self.min_lr_ratio = float(training_cfg.get("min_lr_ratio", 0.0))
+
+        self.sched_g = None
+        self.sched_d = None
+        if self.lr_schedule not in {"none", "off", ""}:
+            def lr_factor(step: int) -> float:
+                total = max(1, int(self.total_steps))
+                warm = max(0, int(self.warmup_steps))
+                min_r = float(self.min_lr_ratio)
+                if warm > 0 and step < warm:
+                    return float(step + 1) / float(warm)
+                if self.lr_schedule == "cosine":
+                    denom = max(1, total - warm)
+                    progress = min(max((step - warm) / denom, 0.0), 1.0)
+                    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                    return min_r + (1.0 - min_r) * cosine
+                if self.lr_schedule == "linear":
+                    denom = max(1, total - warm)
+                    progress = min(max((step - warm) / denom, 0.0), 1.0)
+                    return min_r + (1.0 - min_r) * (1.0 - progress)
+                # Fallback: constant
+                return 1.0
+
+            self.sched_d = torch.optim.lr_scheduler.LambdaLR(self.opt_d, lr_lambda=lambda _: lr_factor(self.global_step))
+            self.sched_g = torch.optim.lr_scheduler.LambdaLR(self.opt_g, lr_lambda=lambda _: lr_factor(self.global_step))
 
         if AutoencoderKL is None:
             raise ImportError("diffusers is required for VAE visualization. Please install diffusers.")
@@ -167,6 +214,7 @@ class StarGANv2Trainer:
     def _save_checkpoint(self, epoch: int) -> None:
         payload = {
             "epoch": epoch,
+            "global_step": int(self.global_step),
             "G": self.G.state_dict(),
             "F": self.F.state_dict(),
             "E": self.E.state_dict(),
@@ -189,6 +237,7 @@ class StarGANv2Trainer:
             self.opt_g.load_state_dict(ckpt["opt_g"])
         if "opt_d" in ckpt:
             self.opt_d.load_state_dict(ckpt["opt_d"])
+        self.global_step = int(ckpt.get("global_step", 0))
         self.start_epoch = int(ckpt.get("epoch", 0)) + 1
 
     def _sample_latent(self, batch_size: int) -> torch.Tensor:
@@ -538,6 +587,13 @@ class StarGANv2Trainer:
                     g_loss.backward()
                     self.opt_g.step()
 
+                # Step-based LR schedule (one step per batch)
+                self.global_step += 1
+                if self.sched_d is not None:
+                    self.sched_d.step()
+                if self.sched_g is not None:
+                    self.sched_g.step()
+
                 logs = self._detach_log(
                     {
                         "d_loss": d_loss,
@@ -550,6 +606,10 @@ class StarGANv2Trainer:
                         "r1": r1_loss,
                     }
                 )
+
+                # Add LR to logs for debugging/plotting (current optimizer lr after stepping)
+                logs["lr_d"] = float(self.opt_d.param_groups[0]["lr"])
+                logs["lr_g"] = float(self.opt_g.param_groups[0]["lr"])
 
                 for key in running:
                     running[key] += logs[key]

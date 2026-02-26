@@ -34,6 +34,9 @@ training:
   weight_decay: 1.0e-4
   use_amp: true
   amp_dtype: bf16
+  allow_tf32: true
+  cudnn_benchmark: true
+  optim_fused: true
   latent_scale: 0.18215
   num_workers: 0
   pin_memory: true
