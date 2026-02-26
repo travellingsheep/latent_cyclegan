@@ -1,3 +1,7 @@
+experiment:
+  name: "stargan_v2_overfit_id_loss_10"
+  outputs_dir: "outputs/{exp_name}"
+
 model:
   latent_channels: 4
   style_dim: 64
@@ -15,6 +19,7 @@ loss:
   w_sty: 1.0
   w_ds: 1.0
   w_cyc: 1.0
+  w_id: 10.0
   w_r1: 10.0
   r1_interval: 16
   ds_decay_epochs: 20
@@ -22,7 +27,7 @@ loss:
 training:
   seed: 42
   batch_size: 64
-  num_epochs: 1000
+  num_epochs: 500
   lr_g: 1.0e-4
   lr_d: 1.0e-4
   lr_mapping: 1.0e-6
@@ -55,8 +60,8 @@ visualization:
   vae_model_name_or_path: "runwayml/stable-diffusion-v1-5"
   vae_subfolder: "vae"
   suppress_hf_warnings: true
-  num_samples: 4
-  save_dir: "outputs/stargan_v2_baseline/vis"
+  num_samples: 5
+  save_dir: "{outputs_dir}/vis"
 
 data:
   data_root: "../pt_datasets/overfit50"
@@ -70,5 +75,5 @@ data:
   epoch_size: null
 
 checkpoint:
-  save_dir: "outputs/stargan_v2_overfit"
+  save_dir: "{outputs_dir}/ckpt"
   resume_path: ""

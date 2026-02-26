@@ -76,15 +76,113 @@
   - **作用**：控制“实时刷新显示”（进度百分比与当前 loss）的刷新步频。
   - **实现逻辑**：在每个 epoch 内，训练循环里当 `step % display_interval == 0` 时，刷新一次显示。
   - **注意**：它只影响终端显示刷新，不影响训练、保存或可视化。
+  - **补充：什么是 step？**
+    - 这里的 `step` 指的是 **一个 batch 的迭代**（也就是 dataloader 里 `for step, batch in ...` 的那个 step）。
+    - `display_interval: 100` 的意思是：每 100 个 batch，在终端刷新一次“当前进度 + loss”。
+  - **补充：为什么你关了 `progress_bar` 但还想要 percent？**
+    - `progress_bar` 只控制是否启用 tqdm 进度条（`progress_style: bar`）。
+    - 如果你用的是 `progress_style: percent`，即使 `progress_bar: false`，也会按 `display_interval` 刷新单行百分比显示（不画进度条）。
 
 - `log_json`
   - **作用**：是否打印结构化的 JSON 日志行（便于重定向到文件或后处理）。
   - **实现逻辑**：仅当 `log_json: true` 时，才会按 `log_interval` 打印一条 JSON。
+  - **会打印什么内容？**
+    - 当前实现打印的是一行 JSON（单行），包含本次 step 的关键标量（都已 `.detach().cpu().item()`）：
+      - `epoch` / `step`
+      - `d_loss` / `g_loss` / `g_adv`
+      - `sty`（style reconstruction）/ `ds`（diversity-sensitive）/ `cyc`（cycle consistency）
+      - `id`（identity loss，若启用 `loss.w_id`）
+      - `r1`（lazy R1 的原始值；只有触发 R1 的 step 才非 0）
+      - `lambda_ds`（当前 epoch 下 diversity weight 的衰减后系数）
+    - 例子（字段可能会随你打开/关闭 loss 而略有变化）：
+      - `{"d_loss": 0.82341, "g_loss": 1.23018, "g_adv": 0.91234, "sty": 0.10203, "ds": 0.33122, "cyc": 0.28811, "id": 0.0, "r1": 0.0, "epoch": 3, "step": 150, "lambda_ds": 0.85}`
+    - 另外会附带 `time` 字段（本地时间戳，格式 `YYYY-mm-dd HH:MM:SS`），方便你回放日志定位。
 
 - `log_interval`
   - **作用**：JSON 日志输出的步频。
   - **实现逻辑**：当 `log_json: true` 且 `step % log_interval == 0` 时，打印一行 JSON（包含 `d_loss/g_loss/.../r1` 等）。
   - **注意**：如果 `log_json: false`，这个参数不会触发任何输出。
+
+### 每个 epoch 有多少 step？如何计算？
+
+在本工程里：
+- `step/total_steps` 的 `total_steps` 就是 `len(dataloader)`。
+- `dataloader` 是由 `torch.utils.data.DataLoader(dataset, batch_size=..., drop_last=...)` 构成。
+
+因此每个 epoch 的 step 数（batch 数）由下面这些决定：
+- `len(dataset)`：这里等于 `data.epoch_size`（见 `dataset.py` 的 `LatentMultiDomainDataset.__len__`）。
+  - 如果 `data.epoch_size: null`，会被自动设为 `max_count * num_domains`，其中 `max_count` 是所有域目录中样本数的最大值。
+- `training.batch_size`
+- `training.drop_last`
+
+直观公式：
+- 当 `drop_last: true`：$\text{steps\_per\_epoch} = \left\lfloor \frac{\text{epoch\_size}}{\text{batch\_size}} \right\rfloor$
+- 当 `drop_last: false`：$\text{steps\_per\_epoch} = \left\lceil \frac{\text{epoch\_size}}{\text{batch\_size}} \right\rceil$
+
+训练总 step 数大致是 $\text{num\_epochs} \times \text{steps\_per\_epoch}$（如果从 checkpoint resume，会从 `start_epoch` 接着跑）。
+
+### 把运行期打印内容保存到文件
+
+如果你希望把训练过程中终端打印的内容（包括 `[Info]/[Warn]`、epoch summary、`log_json` 行、tqdm/percent 进度输出等）单独保存到一个文件里，可以在配置里加：
+
+```yaml
+training:
+  console_log_path: "outputs/stargan_v2_baseline/console.log"
+```
+
+说明：
+- 该文件会以追加模式写入（append）。如果想重新开始一份干净日志，手动删除旧文件即可。
+- 如果你使用 `progress_style: percent` 或 `progress_style: bar`，进度输出包含回车刷新（`\r`），写到文件里可能看起来不够“整齐”；这时更建议同时开启 `log_json: true`，用 JSON 行做离线分析。
+
+## Loss-epoch 折线图
+
+训练会在 `run.py` 里记录每个 epoch 的 loss 均值（就是 `[Epoch Summary]` 打印的那些 key），并用 matplotlib 画出 **loss vs epoch** 的多条折线（不同颜色代表不同 loss）。
+
+配置项（都在 `training:` 里）：
+
+```yaml
+training:
+  loss_plot_interval: 1
+  loss_plot_path: "{outputs_dir}/loss_curve.png"
+```
+
+说明：
+- `loss_plot_interval: 1` 表示每个 epoch 保存一次图。
+- 默认会保存到 `{outputs_dir}/loss_curve.png`；你可以改成任意路径。
+
+## 全局实验名称（自动生成输出路径）
+
+很多时候你会把同一个字符串当作“实验名”，并希望它自动影响这些路径：
+- `training.console_log_path`
+- `visualization.save_dir`
+- `checkpoint.save_dir`
+
+本工程支持在配置顶部声明：
+
+```yaml
+experiment:
+  name: "stargan_v2_baseline_id2"
+  outputs_dir: "outputs/{exp_name}"   # 可选，默认就是 outputs/{exp_name}
+```
+
+然后在任意路径字符串里使用占位符：
+- `{exp_name}`：实验名
+- `{outputs_dir}`：输出根目录（默认 `outputs/{exp_name}`）
+
+例子：
+
+```yaml
+training:
+  console_log_path: "{outputs_dir}/console.log"
+
+visualization:
+  save_dir: "{outputs_dir}/vis"
+
+checkpoint:
+  save_dir: "{outputs_dir}/ckpt"
+```
+
+这样你只需要改 `experiment.name`，所有相关输出路径会在启动时自动展开。
 
 - `save_interval`
   - **作用**：checkpoint 保存频率（以 epoch 为单位）。

@@ -4,9 +4,12 @@ import json
 import logging
 from pathlib import Path
 from typing import Dict
+from datetime import datetime
+import time
 import warnings
 
 import torch
+import torch.nn.functional as nnF
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from torchvision.utils import make_grid, save_image
@@ -96,6 +99,7 @@ class StarGANv2Trainer:
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.save_interval = int(training_cfg.get("save_interval", 10))
         self.log_interval = int(training_cfg.get("log_interval", 50))
+        # progress_bar controls tqdm bar only; percent printing is controlled by progress_style.
         self.show_progress = bool(training_cfg.get("progress_bar", True))
         self.progress_style = str(training_cfg.get("progress_style", "percent")).lower()
         if self.progress_style not in {"bar", "percent", "off"}:
@@ -379,6 +383,7 @@ class StarGANv2Trainer:
             "sty": 0.0,
             "ds": 0.0,
             "cyc": 0.0,
+            "id": 0.0,
             "r1": 0.0,
         }
         num_steps = 0
@@ -388,9 +393,23 @@ class StarGANv2Trainer:
         w_adv = float(loss_cfg.get("w_adv", 1.0))
         w_sty = float(loss_cfg.get("w_sty", 1.0))
         w_cyc = float(loss_cfg.get("w_cyc", 1.0))
+        w_id = float(loss_cfg.get("w_id", 0.0))
 
         total_steps = len(self.loader)
         use_tqdm = self.show_progress and self.progress_style == "bar"
+        epoch_start_t = time.time()
+
+        def _fmt_hms(seconds: float) -> str:
+            seconds = max(0.0, float(seconds))
+            m, s = divmod(int(seconds + 0.5), 60)
+            h, m = divmod(m, 60)
+            if h > 0:
+                return f"{h:d}:{m:02d}:{s:02d}"
+            return f"{m:02d}:{s:02d}"
+
+        def _now_str() -> str:
+            return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
         if use_tqdm:
             epoch_iter = tqdm(
                 self.loader,
@@ -496,7 +515,19 @@ class StarGANv2Trainer:
                     cyc_lat = cycle_consistency_loss(rec_lat, content)
                     cyc_loss = cyc_ref + cyc_lat
 
-                    g_loss = w_adv * g_adv + w_sty * sty_loss + w_cyc * cyc_loss - ds_weight * ds_loss
+                    if w_id > 0.0:
+                        id_out = self.G(content, s_src)
+                        id_loss = nnF.l1_loss(id_out, content)
+                    else:
+                        id_loss = torch.zeros((), device=self.device)
+
+                    g_loss = (
+                        w_adv * g_adv
+                        + w_sty * sty_loss
+                        + w_cyc * cyc_loss
+                        + w_id * id_loss
+                        - ds_weight * ds_loss
+                    )
 
                 self.opt_g.zero_grad(set_to_none=True)
                 if self.scaler_g.is_enabled():
@@ -515,6 +546,7 @@ class StarGANv2Trainer:
                         "sty": sty_loss,
                         "ds": ds_loss,
                         "cyc": cyc_loss,
+                        "id": id_loss,
                         "r1": r1_loss,
                     }
                 )
@@ -529,22 +561,29 @@ class StarGANv2Trainer:
                     printable["epoch"] = epoch
                     printable["step"] = step
                     printable["lambda_ds"] = round(ds_weight, 6)
+                    printable["time"] = _now_str()
                     print(json.dumps(printable, ensure_ascii=False))
 
                 if step % self.display_interval == 0:
                     progress = 100.0 * step / max(1, total_steps)
+                    elapsed = time.time() - epoch_start_t
+                    step_avg = elapsed / max(1, step)
+                    eta = step_avg * max(0, total_steps - step)
+                    t_pair = f"{_fmt_hms(elapsed)}/{_fmt_hms(eta)}"
+                    ts = _now_str()
                     if use_tqdm:
                         epoch_iter.set_postfix(
                             pct=f"{progress:.1f}%",
+                            t=t_pair,
                             d=round(logs["d_loss"], 4),
                             g=round(logs["g_loss"], 4),
                             r1=round(logs["r1"], 4),
                         )
-                    elif self.show_progress and self.progress_style == "percent":
+                    elif self.progress_style == "percent":
                         msg = (
-                            f"\rEpoch {epoch}/{self.num_epochs} | "
-                            f"{progress:6.2f}% | "
-                            f"d={logs['d_loss']:.4f} g={logs['g_loss']:.4f} r1={logs['r1']:.4f}"
+                            f"\r{ts} | Epoch {epoch}/{self.num_epochs} | "
+                            f"{progress:6.2f}% | t={t_pair} | "
+                            f"d={logs['d_loss']:.4f} g={logs['g_loss']:.4f} id={logs['id']:.4f} r1={logs['r1']:.4f}"
                         )
                         print(msg, end="", flush=True)
 
@@ -563,7 +602,7 @@ class StarGANv2Trainer:
 
         if use_tqdm:
             epoch_iter.close()
-        elif self.show_progress and self.progress_style == "percent":
+        elif self.progress_style == "percent":
             print()
 
         if num_steps == 0:
