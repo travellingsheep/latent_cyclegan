@@ -200,10 +200,35 @@ class StarGANv2Trainer:
         self.eval_num_samples = int(vae_cfg.get("num_samples", 4))
         self._cached_eval_batch = None
 
+        # Visualization subfolders (two modes):
+        # - ref: style extracted from reference image via style encoder
+        # - random_noise: style generated from fixed-seed random noise via mapping network
+        self.vis_ref_dir = self.vis_dir / "ref"
+        self.vis_random_noise_dir = self.vis_dir / "random_noise"
+        self.vis_ref_dir.mkdir(parents=True, exist_ok=True)
+        self.vis_random_noise_dir.mkdir(parents=True, exist_ok=True)
+
+        # Offline-eval settings
+        data_cfg = config.get("data", {}) if isinstance(config.get("data", {}), dict) else {}
+        self.eval_data_root = str(data_cfg.get("eval_data_root", "")).strip() or None
+        self.eval_dir = Path(str(vae_cfg.get("eval_dir", str(self.save_dir.parent / "eval")))).expanduser()
+        self.eval_dir.mkdir(parents=True, exist_ok=True)
+
+        # Fixed random-noise latents (sample once and reuse).
+        # Use a separate seed to make the random_noise visualization stable across epochs.
+        rn_seed = int(vae_cfg.get("random_noise_seed", config.get("training", {}).get("seed", 42)))
+        rn_gen = torch.Generator(device="cpu")
+        rn_gen.manual_seed(rn_seed)
+        self.random_noise_z = torch.randn(self.num_domains, self.z_dim, generator=rn_gen, dtype=torch.float32)
+
         self.start_epoch = 1
         resume_path = config["checkpoint"].get("resume_path", "").strip()
         if resume_path:
-            self._load_checkpoint(resume_path)
+            rp = Path(resume_path)
+            if rp.exists():
+                self._load_checkpoint(resume_path)
+            else:
+                print(f"[Warn] resume_path does not exist, training from scratch: {rp}")
 
     def _lambda_ds(self, epoch: int) -> float:
         loss_cfg = self.cfg["loss"]
@@ -280,6 +305,56 @@ class StarGANv2Trainer:
         style_ref_raw = batch["target_style"]
         return content_raw, style_ref_raw
 
+    def _load_latent_tensor_any(self, path: Path) -> torch.Tensor:
+        """Load a latent tensor from .pt/.npy. Returns float32 [C,H,W]."""
+        if path.suffix == ".pt":
+            data = torch.load(path, map_location="cpu")
+            if isinstance(data, dict):
+                if "latent" in data:
+                    data = data["latent"]
+                elif "x" in data:
+                    data = data["x"]
+                else:
+                    data = next(iter(data.values()))
+            tensor = data if isinstance(data, torch.Tensor) else torch.as_tensor(data)
+        elif path.suffix == ".npy":
+            import numpy as np
+
+            array = np.load(path)
+            tensor = torch.from_numpy(array)
+        else:
+            raise ValueError(f"Unsupported latent format: {path}")
+
+        tensor = tensor.float()
+        if tensor.dim() == 4 and tensor.size(0) == 1:
+            tensor = tensor.squeeze(0)
+        if tensor.dim() != 3:
+            raise ValueError(f"Expected latent shape [C,H,W], got {tuple(tensor.shape)} from {path}")
+        return tensor.contiguous()
+
+    def _get_eval_domain_latents_from_root(self, data_root: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (content_raw, style_ref_raw) for visualization, one sample per domain.
+
+        Uses the first latent file (sorted) under each domain folder.
+        """
+        root = Path(data_root)
+        if not root.exists():
+            raise FileNotFoundError(f"eval_data_root not found: {root}")
+
+        latents = []
+        for domain in (self.domain_names or [str(i) for i in range(self.num_domains)]):
+            domain_dir = root / domain
+            if not domain_dir.exists():
+                raise FileNotFoundError(f"Domain directory not found under eval_data_root: {domain_dir}")
+            files = sorted([*domain_dir.glob("*.pt"), *domain_dir.glob("*.npy")])
+            if not files:
+                raise RuntimeError(f"No .pt/.npy files found in {domain_dir}")
+            latents.append(self._load_latent_tensor_any(files[0]))
+
+        content_raw = torch.stack(latents, dim=0)
+        style_ref_raw = torch.stack(latents, dim=0)
+        return content_raw, style_ref_raw
+
     def _decode_latent_to_image(self, latent: torch.Tensor) -> torch.Tensor:
         latent = latent.to(self.device, dtype=self.vae_dtype)
         with torch.no_grad():
@@ -295,6 +370,7 @@ class StarGANv2Trainer:
         n_vis: int,
         cell_hw: tuple[int, int],
         padding: int,
+        title: str | None = None,
     ) -> None:
         if Image is None or ImageDraw is None or ImageFont is None:
             return
@@ -341,13 +417,43 @@ class StarGANv2Trainer:
             _, y = cell_center(col=0, row=i + 1)
             draw.text((x, y), name, fill=(255, 255, 255), font=font, anchor="mm")
 
+        if title:
+            draw.text((10, 8), title, fill=(255, 255, 255), font=font)
+
         canvas.save(out_path)
 
-    def evaluate(self, epoch: int) -> None:
+    @torch.no_grad()
+    def _evaluate_grid(
+        self,
+        *,
+        mode: str,
+        out_path: Path,
+        data_root: str | None,
+        title_prefix: str,
+    ) -> None:
+        """Generate a labeled translation grid.
+
+        mode:
+          - 'ref': use style encoder on reference images
+          - 'random_noise': use mapping network on fixed-seed noise
+        data_root:
+          - None: use training dataset's first latent for each domain
+          - str: load first latent per domain from that root (offline eval)
+        """
+        mode = str(mode).strip().lower()
+        if mode not in {"ref", "random_noise"}:
+            raise ValueError(f"Unknown mode: {mode}")
+
+        # Switch to eval
         self.G.eval()
         self.E.eval()
+        self.F.eval()
 
-        content_raw, style_ref_raw = self._get_eval_domain_latents()
+        if data_root:
+            content_raw, style_ref_raw = self._get_eval_domain_latents_from_root(data_root)
+        else:
+            content_raw, style_ref_raw = self._get_eval_domain_latents()
+
         content_raw = content_raw.to(self.device, non_blocking=True)
         style_ref_raw = style_ref_raw.to(self.device, non_blocking=True)
 
@@ -359,34 +465,37 @@ class StarGANv2Trainer:
         content_scaled = content_raw * self.latent_scale
         style_ref_scaled = style_ref_raw * self.latent_scale
 
-        content_for_decode = content_scaled / self.latent_scale
-        style_for_decode = style_ref_scaled / self.latent_scale
+        # Decode headers (content + reference images) for better readability.
+        content_img = self._decode_latent_to_image(content_scaled / self.latent_scale)
+        style_img = self._decode_latent_to_image(style_ref_scaled / self.latent_scale)
 
-        content_img = self._decode_latent_to_image(content_for_decode)
-        style_img = self._decode_latent_to_image(style_for_decode)
-
-        with torch.no_grad():
-            with torch.amp.autocast(
-                device_type=self.device.type,
-                enabled=self.use_amp,
-                dtype=self.autocast_dtype,
-            ):
-                # Precompute one style vector per target domain.
-                target_styles = []
+        with torch.amp.autocast(
+            device_type=self.device.type,
+            enabled=self.use_amp,
+            dtype=self.autocast_dtype,
+        ):
+            # Precompute one style vector per target domain.
+            target_styles: list[torch.Tensor] = []
+            if mode == "ref":
                 for j in range(n_vis):
                     yj = torch.full((1,), j, device=self.device, dtype=torch.long)
                     sj = self.E(style_ref_scaled[j : j + 1], yj)
                     target_styles.append(sj)
-
-                # Generate translations: for each target j, translate all sources i.
-                translated_latents = []
+            else:
+                # fixed-seed noise sampled once in __init__ and reused
+                z = self.random_noise_z[:n_vis].to(self.device)
+                y = torch.arange(n_vis, device=self.device, dtype=torch.long)
+                s_all = self.F(z, y)
                 for j in range(n_vis):
-                    sj = target_styles[j].expand(n_vis, -1)
-                    fake_scaled = self.G(content_scaled, sj)
-                    translated_latents.append(fake_scaled)
+                    target_styles.append(s_all[j : j + 1])
 
-        # translated_latents[j] has shape [n_vis,4,H,W] for target j
-        # Convert to images and form matrix (including same-domain i->i generation)
+            # Generate translations: for each target j, translate all sources i.
+            translated_latents = []
+            for j in range(n_vis):
+                sj = target_styles[j].expand(n_vis, -1)
+                fake_scaled = self.G(content_scaled, sj)
+                translated_latents.append(fake_scaled)
+
         translated_imgs = []
         for j in range(n_vis):
             fake_for_decode = translated_latents[j] / self.latent_scale
@@ -394,31 +503,81 @@ class StarGANv2Trainer:
 
         blank = torch.zeros_like(content_img[0])
         grid_cells = [blank]
-
-        # Header row: target domain reference images
         grid_cells.extend(style_img)
-
-        # Rows: source content header + translations
         for i in range(n_vis):
             grid_cells.append(content_img[i])
             for j in range(n_vis):
-                # if i == j:
-                #     grid_cells.append(content_img[i])
-                # else:
                 grid_cells.append(translated_imgs[j][i])
 
         padding = 4
         grid = make_grid(torch.stack(grid_cells, dim=0), nrow=n_vis + 1, padding=padding)
-        out_path = self.vis_dir / f"epoch_{epoch:04d}.png"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         save_image(grid, out_path)
 
-        # Overwrite with labeled version if Pillow is available.
         names = self.domain_names[:n_vis] if self.domain_names else [str(i) for i in range(n_vis)]
         cell_hw = (int(content_img.shape[-2]), int(content_img.shape[-1]))
-        self._save_grid_with_labels(grid, names, out_path, n_vis=n_vis, cell_hw=cell_hw, padding=padding)
+        title = f"{title_prefix} | mode={mode}"
+        self._save_grid_with_labels(grid, names, out_path, n_vis=n_vis, cell_hw=cell_hw, padding=padding, title=title)
+
+        # Restore train mode is handled by caller if needed.
+
+    def evaluate(self, epoch: int) -> None:
+        # Training-time visualization uses the training dataset's first latent per domain.
+        ref_out = self.vis_ref_dir / f"epoch_{epoch:04d}_ref.png"
+        rn_out = self.vis_random_noise_dir / f"epoch_{epoch:04d}_random_noise.png"
+
+        self._evaluate_grid(mode="ref", out_path=ref_out, data_root=None, title_prefix=f"epoch={epoch:04d}")
+        self._evaluate_grid(
+            mode="random_noise",
+            out_path=rn_out,
+            data_root=None,
+            title_prefix=f"epoch={epoch:04d} | seed={int(self.cfg.get('visualization', {}).get('random_noise_seed', self.cfg.get('training', {}).get('seed', 42)))}",
+        )
 
         self.G.train()
         self.E.train()
+        self.F.train()
+
+    def evaluate_checkpoint(self, ckpt_path: str, *, data_root: str | None = None, out_dir: str | Path | None = None) -> None:
+        """Offline eval for an arbitrary checkpoint.
+
+        Saves two grids under out_dir:
+          - <ckpt_stem>_ref.png
+          - <ckpt_stem>_random_noise.png
+        data_root defaults to config.data.eval_data_root (if set) else training data.
+        """
+        ckpt_p = Path(ckpt_path)
+        if not ckpt_p.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_p}")
+
+        # Load weights (keeps optimizer state untouched; this is for visualization only).
+        self._load_checkpoint(str(ckpt_p))
+
+        effective_root = data_root if data_root is not None else self.eval_data_root
+        out_root = Path(out_dir) if out_dir is not None else self.eval_dir
+        out_root.mkdir(parents=True, exist_ok=True)
+
+        stem = ckpt_p.stem
+        ref_out = out_root / f"{stem}_ref.png"
+        rn_out = out_root / f"{stem}_random_noise.png"
+
+        title_prefix = f"ckpt={stem}"
+        if effective_root:
+            title_prefix = f"{title_prefix} | split=eval"
+        else:
+            title_prefix = f"{title_prefix} | split=train"
+
+        self._evaluate_grid(mode="ref", out_path=ref_out, data_root=effective_root, title_prefix=title_prefix)
+        self._evaluate_grid(
+            mode="random_noise",
+            out_path=rn_out,
+            data_root=effective_root,
+            title_prefix=f"{title_prefix} | seed={int(self.cfg.get('visualization', {}).get('random_noise_seed', self.cfg.get('training', {}).get('seed', 42)))}",
+        )
+
+        self.G.train()
+        self.E.train()
+        self.F.train()
 
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         self.G.train()

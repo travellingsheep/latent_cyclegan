@@ -1,5 +1,5 @@
 experiment:
-  name: "stargan_v2_baseline_smaller_epoch_limited_diversity_id1"
+  name: "stargan_v2_baseline_smaller_epoch_limited_diversity_id02_higher_lr_d"
   # outputs_dir: "outputs/stargan_v2_baseline_id2"
 
 model:
@@ -20,7 +20,7 @@ loss:
   w_ds: 1.0
   ds_margin: 1.5   # diversity loss 截断上限；null/不填表示不截断
   w_cyc: 1.0
-  w_id: 1.0
+  w_id: 0.2
   w_r1: 2.0
   r1_interval: 16
   ds_decay_epochs: 20
@@ -30,7 +30,7 @@ training:
   batch_size: 64
   num_epochs: 100
   lr_g: 1.0e-4
-  lr_d: 1.0e-4
+  lr_d: 3.0e-4
   lr_mapping: 1.0e-6
   weight_decay: 1.0e-4
   lr_schedule: none     # none | cosine | linear (step-based)
@@ -70,9 +70,19 @@ visualization:
   suppress_hf_warnings: true
   num_samples: 5
   save_dir: "{outputs_dir}/vis"
+  # random_noise 模式：固定种子采样一次 z，并在整个训练/离线评估过程中复用。
+  random_noise_seed: 42
+
+  # 离线评估输出目录（每次实验目录下的 eval/）
+  eval_dir: "{outputs_dir}/eval"
+  # 训练结束后，自动使用 latest.pt 做一次离线可视化（ref + random_noise）。
+  auto_eval_latest: true
 
 data:
   data_root: "../pt_datasets/unscaled_dataset"
+  # 离线 eval 使用的测试集（同样是按 domain 子文件夹组织的 .pt/.npy latents）
+  # 如果留空/不填，则离线 eval 会退回使用训练集 data_root。
+  eval_data_root: "../pt_datasets/unscaled_test_dataset"
   domains:
     - photo
     - Hayao

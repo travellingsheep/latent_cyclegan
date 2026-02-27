@@ -108,6 +108,12 @@ def parse_args() -> argparse.Namespace:
         default="configs/stargan_v2_latent.yaml",
         help="Path to config file (.yaml/.yml/.json)",
     )
+    parser.add_argument(
+        "--eval_ckpt",
+        type=str,
+        default="",
+        help="Optional: evaluate a checkpoint and exit (saves ref + random_noise grids)",
+    )
     return parser.parse_args()
 
 
@@ -260,6 +266,19 @@ def main() -> None:
         device=device,
     )
 
+    # Offline eval mode
+    eval_ckpt = str(getattr(args, "eval_ckpt", "")).strip()
+    if eval_ckpt:
+        vis_cfg = config.get("visualization", {}) if isinstance(config.get("visualization", {}), dict) else {}
+        outputs_root = Path(
+            config.get("experiment", {}).get("outputs_dir", Path(config["checkpoint"]["save_dir"]).parent)
+        )
+        eval_dir = Path(str(vis_cfg.get("eval_dir", str(outputs_root / "eval"))))
+        eval_dir.mkdir(parents=True, exist_ok=True)
+        trainer.evaluate_checkpoint(eval_ckpt, out_dir=eval_dir)
+        print(f"[Info] eval saved to: {eval_dir}")
+        return
+
     num_epochs = int(training_cfg["num_epochs"])
 
     outputs_root = Path(
@@ -319,6 +338,27 @@ def main() -> None:
         _update_history(epoch, printable)
         if loss_plot_interval > 0 and (epoch % loss_plot_interval == 0):
             _save_loss_plot()
+
+    # Ensure latest.pt exists for downstream eval usage.
+    latest_ckpt = Path(config["checkpoint"]["save_dir"]) / "latest.pt"
+    if not latest_ckpt.exists():
+        try:
+            trainer._save_checkpoint(num_epochs)  # type: ignore[attr-defined]
+        except Exception as exc:
+            print(f"[Warn] failed to save latest checkpoint at end of training: {exc}")
+
+    # Auto offline-eval latest checkpoint after training
+    vis_cfg = config.get("visualization", {}) if isinstance(config.get("visualization", {}), dict) else {}
+    if bool(vis_cfg.get("auto_eval_latest", False)):
+        outputs_root = Path(
+            config.get("experiment", {}).get("outputs_dir", Path(config["checkpoint"]["save_dir"]).parent)
+        )
+        eval_dir = Path(str(vis_cfg.get("eval_dir", str(outputs_root / "eval"))))
+        try:
+            trainer.evaluate_checkpoint(str(latest_ckpt), out_dir=eval_dir)
+            print(f"[Info] auto-eval latest saved to: {eval_dir}")
+        except Exception as exc:
+            print(f"[Warn] auto-eval latest failed: {exc}")
 
 
 if __name__ == "__main__":
