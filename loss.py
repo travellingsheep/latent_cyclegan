@@ -18,8 +18,24 @@ def style_reconstruction_loss(pred_style: torch.Tensor, target_style: torch.Tens
     return F.l1_loss(pred_style, target_style)
 
 
-def diversity_sensitive_loss(fake_1: torch.Tensor, fake_2: torch.Tensor) -> torch.Tensor:
-    return F.l1_loss(fake_1, fake_2)
+def diversity_sensitive_loss(
+    fake_1: torch.Tensor,
+    fake_2: torch.Tensor,
+    margin: float | None = None,
+) -> torch.Tensor:
+    """Diversity sensitive loss.
+
+    Note: In training we subtract this term (i.e. encourage distance). When margin is set,
+    we clamp the distance so once it exceeds the margin the gradient from this term becomes 0.
+    """
+
+    dist = F.l1_loss(fake_1, fake_2)
+    if margin is None:
+        return dist
+    margin_v = float(margin)
+    if margin_v <= 0.0:
+        return dist
+    return torch.clamp(dist, max=margin_v)
 
 
 def cycle_consistency_loss(reconstructed: torch.Tensor, original: torch.Tensor) -> torch.Tensor:

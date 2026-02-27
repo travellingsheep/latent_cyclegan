@@ -18,6 +18,7 @@ loss:
   w_adv: 1.0
   w_sty: 1.0
   w_ds: 1.0
+  ds_margin: 1.5   # diversity loss 截断上限；null/不填表示不截断
   w_cyc: 1.0
   w_id: 10.0
   w_r1: 10.0
@@ -32,6 +33,7 @@ training:
   lr_d: 1.0e-4
   lr_mapping: 1.0e-6
   weight_decay: 1.0e-4
+  lr_schedule: none     # none | cosine | linear (step-based)
   use_amp: true
   amp_dtype: bf16
   allow_tf32: true

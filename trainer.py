@@ -74,6 +74,7 @@ class StarGANv2Trainer:
         self.latent_scale = float(config.get("training", {}).get("latent_scale", 0.18215))
         self.w_r1 = float(config.get("loss", {}).get("w_r1", 10.0))
         self.r1_interval = max(1, int(config.get("loss", {}).get("r1_interval", 16)))
+        self.ds_margin = config.get("loss", {}).get("ds_margin", None)
 
         optim_fused = bool(training_cfg.get("optim_fused", True))
         fused_ok = self.device.type == "cuda" and optim_fused
@@ -385,7 +386,7 @@ class StarGANv2Trainer:
                     translated_latents.append(fake_scaled)
 
         # translated_latents[j] has shape [n_vis,4,H,W] for target j
-        # Convert to images and form matrix with diagonal as identity (original content)
+        # Convert to images and form matrix (including same-domain i->i generation)
         translated_imgs = []
         for j in range(n_vis):
             fake_for_decode = translated_latents[j] / self.latent_scale
@@ -401,10 +402,10 @@ class StarGANv2Trainer:
         for i in range(n_vis):
             grid_cells.append(content_img[i])
             for j in range(n_vis):
-                if i == j:
-                    grid_cells.append(content_img[i])
-                else:
-                    grid_cells.append(translated_imgs[j][i])
+                # if i == j:
+                #     grid_cells.append(content_img[i])
+                # else:
+                grid_cells.append(translated_imgs[j][i])
 
         padding = 4
         grid = make_grid(torch.stack(grid_cells, dim=0), nrow=n_vis + 1, padding=padding)
@@ -555,7 +556,7 @@ class StarGANv2Trainer:
                     s_2 = self.F(z_2, y_trg)
                     fake_1 = self.G(content, s_1)
                     fake_2 = self.G(content, s_2)
-                    ds_loss = diversity_sensitive_loss(fake_1, fake_2)
+                    ds_loss = diversity_sensitive_loss(fake_1, fake_2, margin=self.ds_margin)
 
                     s_src = self.E(content, y_src)
                     rec_ref = self.G(fake_ref, s_src)

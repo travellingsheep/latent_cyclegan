@@ -42,6 +42,24 @@
 - `cycle_consistency_loss(reconstructed, original)`
 - `r1_penalty(real_logits, real_inputs)`
 
+#### diversity loss 截断（防止 ds 影响过大）
+
+在生成器 loss 里 diversity loss 是**被减去的**（鼓励 `fake_1` 与 `fake_2` 不同）。当 `ds` 数值过大时，可能压过其他项。
+
+新增配置（在 `loss:` 段）：
+
+```yaml
+loss:
+  ds_margin: 1.5   # null/不填表示不截断
+```
+
+实现逻辑：
+- 计算 `dist = L1(fake_1, fake_2)`
+- 返回 `clamp(dist, max=ds_margin)`
+
+效果：
+- 当 `dist > ds_margin` 后，这一项不再继续增大，对应梯度也会消失（“多样性够了就不再被 ds 推着走”）。
+
 ### `trainer.py`
 训练引擎：
 - 每个 batch 同时跑两路：
@@ -58,6 +76,7 @@
 - 训练输入 latent 会先乘 `training.latent_scale`（默认 0.18215）进入网络；可视化解码时会除回原始 latent 尺度。
 - `evaluate(epoch)` 会解码并保存网格图到 `visualization.save_dir`（若未配置则默认保存到 checkpoint 目录下的 `vis/`），触发频率由 `visualization.every_epochs` 控制。
 - 可视化网格会使用 `data.domains` 作为行/列标签（需要环境中有 Pillow；若缺失则仅保存无标签网格，不影响训练）。
+- **可视化对角线（i→i）说明**：当前版本对角线不会再“强制显示原图”，而是同样走 `G(content, s_i)` 生成同域映射结果。这可以用来观察模型是否学到了接近恒等的 self-mapping，以及 identity loss 对输出的约束效果。
 
 ### `run.py`
 实验入口：
@@ -109,6 +128,25 @@
 - `step/total_steps` 的 `total_steps` 就是 `len(dataloader)`。
 - `dataloader` 是由 `torch.utils.data.DataLoader(dataset, batch_size=..., drop_last=...)` 构成。
 
+先把几个概念说清楚（对应本工程的实现）：
+
+- **sample（样本）**
+  - `dataset.__getitem__(i)` 返回的一条数据就是 1 个 sample。
+  - 在这里它是一个“配对样本”：`content`（源域 latent）+ `target_style`（目标域 latent）以及对应的域 id。
+
+- **batch**
+  - dataloader 一次取出来的一组 sample。
+  - batch 里 sample 数量由 `training.batch_size` 决定。
+
+- **step（训练步）**
+  - 训练循环里 `for step, batch in dataloader:` 的一次迭代，就是 1 个 step。
+  - 在本工程里，**基本可以把 1 step 理解为“进行一次参数更新”**（一次 D 更新 + 一次 G 更新）。
+  - 所以 step 是你日志（`display_interval`/`log_interval`）、lazy R1（`r1_interval`）、以及 step-based LR schedule 的最小计量单位。
+
+- **epoch**
+  - 一次完整遍历 dataloader 的过程。
+  - 本工程的 dataloader 长度由 `len(dataset)` 决定，而 `len(dataset)` 就是 `data.epoch_size`。
+
 因此每个 epoch 的 step 数（batch 数）由下面这些决定：
 - `len(dataset)`：这里等于 `data.epoch_size`（见 `dataset.py` 的 `LatentMultiDomainDataset.__len__`）。
   - 如果 `data.epoch_size: null`，会被自动设为 `max_count * num_domains`，其中 `max_count` 是所有域目录中样本数的最大值。
@@ -118,6 +156,40 @@
 直观公式：
 - 当 `drop_last: true`：$\text{steps\_per\_epoch} = \left\lfloor \frac{\text{epoch\_size}}{\text{batch\_size}} \right\rfloor$
 - 当 `drop_last: false`：$\text{steps\_per\_epoch} = \left\lceil \frac{\text{epoch\_size}}{\text{batch\_size}} \right\rceil$
+
+另外两条也很有用：
+- **每个 epoch 实际参与训练的 sample 数**：
+  - `drop_last: true` 时约为 `steps_per_epoch * batch_size`（会 <= epoch_size）
+  - `drop_last: false` 时约为 `epoch_size`（最后一个 batch 可能不足 batch_size）
+- **“跑完一次数据集到底需要多少 step？”在本工程里的含义**
+  - 严格意义的“遍历一遍所有文件且每个文件只出现一次”= **不成立**。
+  - 因为本工程的 `dataset.py` 不是按文件顺序遍历，而是每个 epoch 通过 `set_epoch(epoch)` 随机采样索引（会重复、也可能漏掉某些文件）。
+  - 所以更准确的说法是：
+    - 你每个 epoch 会训练 `epoch_size` 个“配对 sample”（带随机性）
+    - 需要多少 step 取决于 `epoch_size/batch_size`（上面的公式）
+  - 如果你只是想让“一个 epoch 的工作量≈原始默认设置”，用 `epoch_size: null`（默认）即可。
+
+### 原先的做法 vs 改进后可调的做法
+
+**原先（默认）做法：`data.epoch_size: null`**
+- `epoch_size` 会被自动设为：`max_count * num_domains`。
+- 直觉上它在“不同域样本数不均匀”时，会让一个 epoch 的规模跟最大域对齐，且让源域采样在域之间更均衡。
+- 但它的副作用是：当数据集很大时，一个 epoch 的 step 数会非常多，导致你感觉“一个 epoch 太慢”。
+
+**改进后做法：手动设置 `data.epoch_size`**
+- 你可以直接把一个 epoch 的工作量（= steps/epoch）控制在你想要的范围，便于快速迭代：
+
+```yaml
+data:
+  epoch_size: 6144
+training:
+  batch_size: 64
+  drop_last: true
+```
+
+- 上面这组大约就是：`steps_per_epoch = 6144 / 64 = 96`。
+- 想要更短/更长 epoch，就按比例调整 `epoch_size`：
+  - 例如目标 `N` 个 step：可以设 `epoch_size = N * batch_size`（并保持 `drop_last: true`），这样 steps 很稳定。
 
 训练总 step 数大致是 $\text{num\_epochs} \times \text{steps\_per\_epoch}$（如果从 checkpoint resume，会从 `start_epoch` 接着跑）。
 
