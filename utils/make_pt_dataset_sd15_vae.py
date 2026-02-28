@@ -155,7 +155,7 @@ def encode_dir_to_pt(
                 # NOTE: output is *unscaled* latents (no 0.18215 scaling)
                 
                 lat = vae.encode(imgs).latent_dist.sample()  # type: ignore[attr-defined]
-                lat = lat * 0.154353
+                # lat = lat * 0.154353
 
         lat = lat.detach().to(dtype=torch.float32).cpu()
 

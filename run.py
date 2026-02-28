@@ -150,13 +150,30 @@ def main() -> None:
                 self.encoding = getattr(primary, "encoding", "utf-8")
 
             def write(self, data):
-                self.primary.write(data)
-                self.secondary.write(data)
-                return len(data)
+                # Be defensive during interpreter shutdown:
+                # background finalizers may still print after the log file is closed.
+                n = 0
+                try:
+                    n = self.primary.write(data)
+                except Exception:
+                    # If primary is broken, there's nothing sensible to do.
+                    return 0
+                try:
+                    self.secondary.write(data)
+                except Exception:
+                    # Ignore file-closed/IO errors from the secondary stream.
+                    pass
+                return n
 
             def flush(self):
-                self.primary.flush()
-                self.secondary.flush()
+                try:
+                    self.primary.flush()
+                except Exception:
+                    pass
+                try:
+                    self.secondary.flush()
+                except Exception:
+                    pass
 
             def isatty(self):
                 return bool(getattr(self.primary, "isatty", lambda: False)())

@@ -1,5 +1,5 @@
 experiment:
-  name: "stargan_v2_baseline_smaller_epoch_limited_diversity_id02_higher_lr_d"
+  name: "new_baseline"
   # outputs_dir: "outputs/stargan_v2_baseline_id2"
 
 model:
@@ -20,7 +20,7 @@ loss:
   w_ds: 1.0
   ds_margin: 1.5   # diversity loss 截断上限；null/不填表示不截断
   w_cyc: 1.0
-  w_id: 0.2
+  w_id: 1.0
   w_r1: 2.0
   r1_interval: 16
   ds_decay_epochs: 20
@@ -30,7 +30,7 @@ training:
   batch_size: 64
   num_epochs: 100
   lr_g: 1.0e-4
-  lr_d: 3.0e-4
+  lr_d: 1.0e-4
   lr_mapping: 1.0e-6
   weight_decay: 1.0e-4
   lr_schedule: none     # none | cosine | linear (step-based)
