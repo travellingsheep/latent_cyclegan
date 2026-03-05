@@ -5,12 +5,17 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils import spectral_norm
 
 
-class AdaIN(nn.Module):
-    def __init__(self, num_features: int, style_dim: int) -> None:
+class AdaGN(nn.Module):
+    def __init__(self, num_features: int, style_dim: int, num_groups: int = 32) -> None:
         super().__init__()
-        self.norm = nn.InstanceNorm2d(num_features, affine=False, eps=1e-5)
+        if num_features % num_groups != 0:
+            raise ValueError(
+                f"num_features ({num_features}) must be divisible by num_groups ({num_groups})"
+            )
+        self.norm = nn.GroupNorm(num_groups=num_groups, num_channels=num_features, affine=False, eps=1e-5)
         self.fc = nn.Linear(style_dim, num_features * 2)
         torch.nn.init.constant_(self.fc.weight, 0.0)
         torch.nn.init.constant_(self.fc.bias, 0.0)
@@ -23,12 +28,11 @@ class AdaIN(nn.Module):
         normalized = self.norm(x)
         return (1.0 + gamma) * normalized + beta
 
-
-class AdaINResBlock(nn.Module):
-    def __init__(self, channels: int, style_dim: int) -> None:
+class AdaGNResBlock(nn.Module):
+    def __init__(self, channels: int, style_dim: int, num_groups: int = 32) -> None:
         super().__init__()
-        self.adain1 = AdaIN(channels, style_dim)
-        self.adain2 = AdaIN(channels, style_dim)
+        self.adain1 = AdaGN(channels, style_dim, num_groups=num_groups)
+        self.adain2 = AdaGN(channels, style_dim, num_groups=num_groups)
         self.act = nn.LeakyReLU(0.2, inplace=True)
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
@@ -51,8 +55,13 @@ class Generator(nn.Module):
         style_dim: int = 64,
         base_dim: int = 256,
         n_res_blocks: int = 4,
+        num_groups: int = 32,
     ) -> None:
         super().__init__()
+        if base_dim % num_groups != 0:
+            raise ValueError(
+                f"Generator base_dim ({base_dim}) must be divisible by num_groups ({num_groups})"
+            )
         self.encoder = nn.Sequential(
             nn.Conv2d(latent_channels, base_dim, kernel_size=3, stride=1, padding=1),
             nn.InstanceNorm2d(base_dim, affine=True),
@@ -62,7 +71,7 @@ class Generator(nn.Module):
             nn.LeakyReLU(0.2, inplace=True),
         )
         self.res_blocks = nn.ModuleList(
-            [AdaINResBlock(base_dim, style_dim) for _ in range(n_res_blocks)]
+            [AdaGNResBlock(base_dim, style_dim, num_groups=num_groups) for _ in range(n_res_blocks)]
         )
         self.decoder = nn.Sequential(
             nn.Conv2d(base_dim, base_dim // 2, kernel_size=3, stride=1, padding=1),
@@ -147,7 +156,7 @@ class Discriminator(nn.Module):
     ) -> None:
         super().__init__()
         layers = [
-            nn.Conv2d(latent_channels, base_dim // 4, kernel_size=3, stride=1, padding=1),
+            spectral_norm(nn.Conv2d(latent_channels, base_dim // 4, kernel_size=3, stride=1, padding=1)),
             nn.LeakyReLU(0.2, inplace=True),
         ]
         in_ch = base_dim // 4
@@ -156,12 +165,12 @@ class Discriminator(nn.Module):
             stride = 2 if i < 2 else 1
             layers.extend(
                 [
-                    nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1),
+                    spectral_norm(nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1)),
                     nn.LeakyReLU(0.2, inplace=True),
                 ]
             )
             in_ch = out_ch
-        layers.append(nn.Conv2d(in_ch, num_domains, kernel_size=1, stride=1, padding=0))
+        layers.append(spectral_norm(nn.Conv2d(in_ch, num_domains, kernel_size=1, stride=1, padding=0)))
         self.main = nn.Sequential(*layers)
 
     def forward_all(self, x: torch.Tensor) -> torch.Tensor:
@@ -188,6 +197,7 @@ def build_models(config: dict) -> StarGANv2Models:
         style_dim=model_cfg["style_dim"],
         base_dim=model_cfg["base_dim"],
         n_res_blocks=model_cfg["n_res_blocks"],
+        num_groups=model_cfg.get("num_groups", 32),
     )
     mapping_network = MappingNetwork(
         latent_dim=model_cfg.get("latent_dim", 16),

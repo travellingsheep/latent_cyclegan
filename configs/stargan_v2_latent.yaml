@@ -6,6 +6,7 @@ model:
   latent_channels: 4
   style_dim: 64
   base_dim: 256
+  num_groups: 32
   num_domains: 5
   n_res_blocks: 6
   d_layers: 3
