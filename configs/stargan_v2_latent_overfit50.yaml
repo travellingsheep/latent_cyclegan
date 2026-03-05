@@ -70,6 +70,8 @@ visualization:
 
 data:
   data_root: "../pt_datasets/overfit50"
+  # 原始 RGB 图像根目录（按 domain 子文件夹组织）。用于 metrics（CLIP prototype、FID、content 指标的 src 图）。
+  image_root: ""
   domains:
     - photo
     - Hayao
@@ -82,3 +84,26 @@ data:
 checkpoint:
   save_dir: "{outputs_dir}/ckpt"
   resume_path: ""
+
+# Offline metrics evaluation (utils/eval.py)
+eval:
+  checkpoint_path: "{outputs_dir}/ckpt/latest.pt"
+  out_dir: "{outputs_dir}/eval_metrics"
+  mode: "both"
+
+  image_size: 256
+  max_src_samples: 30
+  max_ref_cache: 256
+  batch_size: 8
+
+  clip_model_name: "openai/clip-vit-base-patch32"
+  clip_allow_network: false
+
+  disable_lpips: false
+  lpips_chunk_size: 2
+  lpips_no_cpu_fallback: false
+
+  disable_art_fid: false
+  art_fid_max_gen: 200
+  art_fid_max_ref: 200
+  art_fid_batch_size: 16

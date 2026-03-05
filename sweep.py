@@ -214,9 +214,9 @@ def main() -> None:
     base_cfg = _load_yaml(base_config_path)
 
     experiments: List[Dict[str, Any]] = [
-        # {"name": "new_baseline_zero_w_r1", "overrides": {"w_r1": 0.0}},
-        # {"name": "new_baseline_micro_w_r1", "overrides": {"w_r1": 0.1}},
-        # {"name": "new_baseline_small_w_r1", "overrides": {"w_r1": 0.5}},
+        {"name": "new_baseline_zero_w_r1", "overrides": {"w_r1": 0.0}},
+        {"name": "new_baseline_micro_w_r1", "overrides": {"w_r1": 0.2}},
+        {"name": "new_baseline_small_w_r1", "overrides": {"w_r1": 0.5}},
         {"name": "new_baseline_medium_w_r1", "overrides": {"w_r1": 1.0}},
         {"name": "new_baseline_bigger_w_adv", "overrides": {"w_adv": 2.0}},
         {"name": "new_baseline_greater_w_adv", "overrides": {"w_adv": 5.0}},

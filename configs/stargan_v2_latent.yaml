@@ -1,5 +1,5 @@
 experiment:
-  name: "new_baseline"
+  name: "new_baseline_zero_w_r1"
   # outputs_dir: "outputs/stargan_v2_baseline_id2"
 
 model:
@@ -28,12 +28,12 @@ loss:
 training:
   seed: 42
   batch_size: 64
-  num_epochs: 100
+  num_epochs: 20
   lr_g: 1.0e-4
   lr_d: 1.0e-4
   lr_mapping: 1.0e-6
   weight_decay: 1.0e-4
-  lr_schedule: none     # none | cosine | linear (step-based)
+  lr_schedule: cosine     # none | cosine | linear (step-based)
   warmup_steps: 200
   min_lr_ratio: 0.1
   use_amp: true
@@ -83,6 +83,9 @@ data:
   # 离线 eval 使用的测试集（同样是按 domain 子文件夹组织的 .pt/.npy latents）
   # 如果留空/不填，则离线 eval 会退回使用训练集 data_root。
   eval_data_root: "../pt_datasets/unscaled_test_dataset"
+  # 原始 RGB 图像根目录（按 domain 子文件夹组织）。
+  # 评估 metrics（CLIP prototype、FID、以及 content 指标里的 src 图）仅使用这里的原图。
+  image_root: "../datasets"
   domains:
     - photo
     - Hayao
@@ -97,3 +100,32 @@ data:
 checkpoint:
   save_dir: "{outputs_dir}/ckpt"
   resume_path: "{outputs_dir}/ckpt/latest.pt"
+
+# Offline metrics evaluation (utils/eval.py)
+eval:
+  # Which checkpoint to evaluate.
+  checkpoint_path: "{outputs_dir}/ckpt/latest.pt"
+  # Root output directory; actual outputs go into {out_dir}/ref_eval and {out_dir}/random_eval.
+  out_dir: "{outputs_dir}/eval_metrics"
+  # ref | random_noise | both
+  mode: "both"
+
+  # Optional overrides (all optional; defaults shown match utils/eval.py defaults)
+  image_size: 256
+  max_src_samples: 0
+  max_ref_cache: 256
+  batch_size: 8
+
+  clip_model_name: "openai/clip-vit-base-patch32"
+  clip_allow_network: false
+
+  disable_lpips: false
+  lpips_chunk_size: 2
+  lpips_no_cpu_fallback: false
+
+  disable_art_fid: false
+  art_fid_max_gen: 200
+  art_fid_max_ref: 200
+  art_fid_batch_size: 16
+
+  force_rebuild_cache: true

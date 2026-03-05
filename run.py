@@ -92,6 +92,32 @@ def expand_config_templates(config: dict) -> dict:
     return rec(config)
 
 
+def save_resolved_config(config: dict, outputs_root: Path) -> None:
+    """Save the fully-resolved config (after template expansion) into outputs_root."""
+
+    outputs_root.mkdir(parents=True, exist_ok=True)
+    yaml_path = outputs_root / "config_resolved.yaml"
+    json_path = outputs_root / "config_resolved.json"
+
+    try:
+        with yaml_path.open("w", encoding="utf-8") as f:
+            yaml.safe_dump(
+                config,
+                f,
+                sort_keys=False,
+                allow_unicode=True,
+                default_flow_style=False,
+            )
+    except Exception as exc:
+        print(f"[Warn] failed to save resolved YAML config: {exc}")
+
+    try:
+        with json_path.open("w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2, default=str)
+    except Exception as exc:
+        print(f"[Warn] failed to save resolved JSON config: {exc}")
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -122,6 +148,16 @@ def main() -> None:
     config = load_config(args.config)
     config = expand_config_templates(config)
     training_cfg = config["training"]
+
+    # Compute outputs root early and persist the exact config we are about to use.
+    outputs_root = Path(
+        config.get("experiment", {}).get("outputs_dir", Path(config["checkpoint"]["save_dir"]).parent)
+    )
+    try:
+        save_resolved_config(config, outputs_root=outputs_root)
+        print(f"[Info] resolved config saved to: {outputs_root}")
+    except Exception as exc:
+        print(f"[Warn] failed to persist resolved config: {exc}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
