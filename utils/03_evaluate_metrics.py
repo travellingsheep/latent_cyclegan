@@ -60,6 +60,20 @@ def _mean_or_none(xs: list[float]) -> float | None:
     return float(np.mean(np.asarray(xs, dtype=np.float64)))
 
 
+def _resolve_manifest_image_path(raw_path: str, metrics_dir: Path) -> Path:
+    p = Path(str(raw_path)).expanduser()
+    if p.is_absolute():
+        return p
+    cand_metrics = (metrics_dir / p).resolve()
+    if cand_metrics.exists():
+        return cand_metrics
+    project_root = Path(__file__).resolve().parents[1]
+    cand_project = (project_root / p).resolve()
+    if cand_project.exists():
+        return cand_project
+    return cand_metrics
+
+
 def run(config: str, checkpoint: str = "", device: str = "", batch_size: int | None = None) -> dict[str, Any]:
     t0, _ = script_timer_start("03_evaluate_metrics")
     ws = build_workspace(config_path=config, checkpoint=(checkpoint or None), device=(device or None))
@@ -105,8 +119,8 @@ def run(config: str, checkpoint: str = "", device: str = "", batch_size: int | N
     pair_metrics: list[dict[str, Any]] = []
     pbar_pairs = tqdm(pairs, desc="逐图指标(LPIPS/CLIP)", dynamic_ncols=True)
     for item in pbar_pairs:
-        src = ws.metrics_dir / str(item["src_image"])
-        gen = ws.metrics_dir / str(item["gen_image"])
+        src = _resolve_manifest_image_path(str(item["src_image"]), ws.metrics_dir)
+        gen = _resolve_manifest_image_path(str(item["gen_image"]), ws.metrics_dir)
         if (not src.exists()) or (not gen.exists()):
             continue
 
@@ -160,7 +174,7 @@ def run(config: str, checkpoint: str = "", device: str = "", batch_size: int | N
     for key in tqdm(sorted(grouped_metrics.keys()), desc="分组FID", dynamic_ncols=True):
         mode, src_dom, tgt_dom = key
         group = grouped_metrics[key]
-        gen_paths = [ws.metrics_dir / g["gen_image"] for g in group]
+        gen_paths = [_resolve_manifest_image_path(str(g["gen_image"]), ws.metrics_dir) for g in group]
         gen_paths = [p for p in gen_paths if p.exists()]
         if len(gen_paths) < 2:
             continue
@@ -195,7 +209,7 @@ def run(config: str, checkpoint: str = "", device: str = "", batch_size: int | N
     # 3) Diversity LPIPS (pairwise over 5 variants)
     diversity_scores: list[dict[str, Any]] = []
     for g in tqdm(div_groups, desc="多样性LPIPS", dynamic_ncols=True):
-        imgs = [ws.metrics_dir / str(p) for p in g.get("images", [])]
+        imgs = [_resolve_manifest_image_path(str(p), ws.metrics_dir) for p in g.get("images", [])]
         imgs = [p for p in imgs if p.exists() and ("_div_concat" not in p.name)]
         if len(imgs) != 5:
             continue
