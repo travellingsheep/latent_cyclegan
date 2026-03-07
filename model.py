@@ -63,10 +63,10 @@ class Generator(nn.Module):
                 f"Generator base_dim ({base_dim}) must be divisible by num_groups ({num_groups})"
             )
         self.encoder = nn.Sequential(
-            nn.Conv2d(latent_channels, base_dim, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(latent_channels, base_dim, kernel_size=3, stride=1, padding=1),#256*32*32
             nn.InstanceNorm2d(base_dim, affine=True),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(base_dim, base_dim, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(base_dim, base_dim, kernel_size=3, stride=1, padding=1),#256*32*32
             nn.InstanceNorm2d(base_dim, affine=True),
             nn.LeakyReLU(0.2, inplace=True),
         )
@@ -74,9 +74,9 @@ class Generator(nn.Module):
             [AdaGNResBlock(base_dim, style_dim, num_groups=num_groups) for _ in range(n_res_blocks)]
         )
         self.decoder = nn.Sequential(
-            nn.Conv2d(base_dim, base_dim // 2, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(base_dim, base_dim // 2, kernel_size=3, stride=1, padding=1),#128*32*32
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(base_dim // 2, latent_channels, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(base_dim // 2, latent_channels, kernel_size=3, stride=1, padding=1),#4*32*32
         )
 
     def forward(self, x: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
@@ -126,20 +126,20 @@ class StyleEncoder(nn.Module):
         super().__init__()
         mid_dim = max(base_dim // 2, 64)
         self.shared = nn.Sequential(
-            nn.Conv2d(latent_channels, mid_dim, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(latent_channels, mid_dim, kernel_size=3, stride=1, padding=1),#128*32*32
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(mid_dim, base_dim, kernel_size=3, stride=2, padding=1),
+            nn.Conv2d(mid_dim, base_dim, kernel_size=3, stride=2, padding=1),#256*16*16
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(base_dim, base_dim, kernel_size=3, stride=2, padding=1),
+            nn.Conv2d(base_dim, base_dim, kernel_size=3, stride=2, padding=1),#256*8*8
             nn.LeakyReLU(0.2, inplace=True),
-            nn.AdaptiveAvgPool2d(1),
+            nn.AdaptiveAvgPool2d(1),#256*1*1
         )
         self.unshared = nn.ModuleList(
             [nn.Linear(base_dim, style_dim) for _ in range(num_domains)]
         )
 
     def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        h = self.shared(x).flatten(1)
+        h = self.shared(x).flatten(1)#256
         outputs = torch.stack([head(h) for head in self.unshared], dim=1)
         y_expanded = y.view(-1, 1, 1).expand(-1, 1, outputs.size(-1))
         style = torch.gather(outputs, dim=1, index=y_expanded).squeeze(1)
