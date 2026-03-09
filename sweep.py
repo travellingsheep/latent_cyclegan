@@ -47,7 +47,7 @@ def _apply_overrides(cfg: Dict[str, Any], run_name: str, epochs: int, overrides:
     # Only change what the user requested:
     # - experiment.name
     # - training.num_epochs
-    # - one of loss.w_r1 or loss.w_adv
+    # - selected loss weights used by training
     out = dict(cfg)  # shallow copy top-level
 
     exp = _ensure_dict(out, "experiment")
@@ -57,8 +57,9 @@ def _apply_overrides(cfg: Dict[str, Any], run_name: str, epochs: int, overrides:
     training["num_epochs"] = int(epochs)
 
     loss = _ensure_dict(out, "loss")
+    allowed_loss_keys = {"w_r1", "w_adv", "w_id"}
     for k, v in overrides.items():
-        if k not in {"w_r1", "w_adv"}:
+        if k not in allowed_loss_keys:
             raise ValueError(f"Unexpected override key: {k}")
         loss[k] = float(v)
 
@@ -120,6 +121,7 @@ def _write_summary_tables(
             "epochs": int(epochs),
             "w_r1": overrides.get("w_r1", ""),
             "w_adv": overrides.get("w_adv", ""),
+            "w_id": overrides.get("w_id", ""),
             "epoch": "",
             "d_loss": "",
             "g_loss": "",
@@ -148,6 +150,7 @@ def _write_summary_tables(
         "epochs",
         "w_r1",
         "w_adv",
+        "w_id",
         "epoch",
         "d_loss",
         "g_loss",
@@ -195,8 +198,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--epochs",
         type=int,
-        default=50,
-        help="Override training.num_epochs for every run (default: 50)",
+        default=20,
+        help="Override training.num_epochs for every run (default: 20)",
     )
     p.add_argument(
         "--dry_run",
@@ -214,12 +217,12 @@ def main() -> None:
     base_cfg = _load_yaml(base_config_path)
 
     experiments: List[Dict[str, Any]] = [
-        {"name": "new_baseline_zero_w_r1", "overrides": {"w_r1": 0.0}},
-        {"name": "new_baseline_micro_w_r1", "overrides": {"w_r1": 0.2}},
-        {"name": "new_baseline_small_w_r1", "overrides": {"w_r1": 0.5}},
-        {"name": "new_baseline_medium_w_r1", "overrides": {"w_r1": 1.0}},
-        {"name": "new_baseline_bigger_w_adv", "overrides": {"w_adv": 2.0}},
-        {"name": "new_baseline_greater_w_adv", "overrides": {"w_adv": 5.0}},
+        {"name": "zero_w_id", "overrides": {"w_id": 0.0}},
+        {"name": "02_w_id", "overrides": {"w_id": 0.2}},
+        # {"name": "new_baseline_small_w_r1", "overrides": {"w_r1": 0.5}},
+        # {"name": "new_baseline_medium_w_r1", "overrides": {"w_r1": 1.0}},
+        # {"name": "new_baseline_bigger_w_adv", "overrides": {"w_adv": 2.0}},
+        # {"name": "new_baseline_greater_w_adv", "overrides": {"w_adv": 5.0}},
     ]
 
     outputs_dir = repo_root / "outputs"

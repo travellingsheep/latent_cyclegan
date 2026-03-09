@@ -80,15 +80,16 @@ visualization:
   auto_eval_latest: true
 
 data:
-  data_root: "../pt_datasets/unscaled_dataset"
-  # 离线 eval 使用的测试集（同样是按 domain 子文件夹组织的 .pt/.npy latents）
-  # 如果留空/不填，则离线 eval 会退回使用训练集 data_root。
-  eval_data_root: "../pt_datasets/unscaled_test_dataset"
-  # 原始 RGB 图像根目录（按 domain 子文件夹组织）。
-  # 评估 metrics（CLIP prototype、FID、以及 content 指标里的 src 图）仅使用这里的原图。
-  image_root: "../datasets"
-  # 全局 Source 解码图缓存目录（相对项目根目录解析）。
-  # 若留空，则回退到 {outputs_dir}/metrics/common_source_images
+  # data_root：训练集 latent 根目录，按 domain 子文件夹组织 .pt/.npy latent 文件。
+  data_root: "../datasets/pt_datasets/unscaled_dataset"
+  # eval_data_root：离线 eval 使用的测试集 latent 根目录。
+  # 同样按 domain 子文件夹组织 .pt/.npy latent 文件；如果留空，则回退到 data_root。
+  eval_data_root: "../datasets/pt_datasets/unscaled_test_dataset"
+  # image_root：离线评估读取真实 RGB 图像时使用的根目录，不参与训练阶段的 latent 读取。
+  # 这里应包含你要拿来做评估的原图；如果当前评估的是测试集，就应指向测试集原图根目录。
+  image_root: "../test_image_datasets"
+  # decoded_source_dir：预留给“把 source latent 解码回 RGB 后做缓存”的目录，相对项目根目录解析。
+  # 但当前代码版本还没有实际读取这个配置项，所以现在它不会生效，也谈不上自动复用或反复生成。
   decoded_source_dir: "../reconstructed_images"
   domains:
     - photo
