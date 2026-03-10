@@ -3,6 +3,7 @@ experiment:
   # outputs_dir: "outputs/stargan_v2_baseline_id2"
 
 model:
+  exp_branch: baseline_AdaIN  # baseline_AdaIN | AdaGN_with_SN | AdaGN_no_SN
   latent_channels: 4
   style_dim: 64
   base_dim: 256

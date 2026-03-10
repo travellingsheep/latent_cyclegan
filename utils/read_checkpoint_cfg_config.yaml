@@ -1,0 +1,10 @@
+# Path to the checkpoint (.pt) to read.
+# You can use an absolute path, or a path relative to the project root.
+checkpoint_path: ../latent_cyclegan/outputs/new_baseline_zero_w_r1/ckpt/latest.pt
+
+# Where to save extracted cfg.
+# This should point to a file under configs/ (absolute or project-root-relative).
+output_cfg_path: ../latent_cyclegan/outputs/new_baseline_zero_w_r1/ckpt/extracted_checkpoint_cfg.yaml
+
+# Pretty-print indentation for terminal output.
+json_indent: 2
