@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import random
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,13 +10,38 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
+
+
+_ACTIVE_TEXT_LOG_PATH: Optional[str] = None
 
 
 def _require(cond: bool, msg: str) -> None:
     if not cond:
         raise ValueError(msg)
+
+
+def _now_str() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+
+def _set_active_text_log_path(path: Optional[str]) -> None:
+    global _ACTIVE_TEXT_LOG_PATH
+    _ACTIVE_TEXT_LOG_PATH = path
+
+
+def log_message(message: str, log_path: Optional[str] = None, flush: bool = True) -> None:
+    timestamped = f"[{_now_str()}] {message}"
+    print(timestamped, flush=flush)
+
+    target_path = log_path if log_path is not None else _ACTIVE_TEXT_LOG_PATH
+    if not target_path:
+        return
+
+    os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
+    with open(target_path, "a", encoding="utf-8") as file_obj:
+        file_obj.write(timestamped + "\n")
 
 
 def set_seed(seed: int) -> None:
@@ -137,7 +163,7 @@ def load_checkpoint(
 
         missing, unexpected = module.load_state_dict(mapped, strict=False)
         if missing or unexpected:
-            print(
+            log_message(
                 f"[warn] Loaded discriminator '{name}' with compatibility mapping. "
                 f"missing={len(missing)} unexpected={len(unexpected)}"
             )
@@ -286,8 +312,12 @@ def load_latent_tensor(pt_path: Path) -> torch.Tensor:
 
 
 class DomainLatentDataset(Dataset):
-    def __init__(self, root_dir: str, latent_divisor: float = 1.0):
+    def __init__(self, root_dir: str, latent_divisor: float = 1.0, max_samples: int = -1, seed: int = 42):
         self.paths = list_pt_files(root_dir)
+        if max_samples > 0 and max_samples < len(self.paths):
+            rng = random.Random(seed)
+            self.paths = rng.sample(self.paths, max_samples)
+            log_message(f"Dataset {root_dir} truncated to {max_samples} samples (seed={seed})")
         if latent_divisor <= 0:
             raise ValueError("latent_divisor must be > 0")
         self.latent_divisor = float(latent_divisor)
@@ -455,8 +485,10 @@ def decode_latents_to_images(
 
 def write_jsonl_line(path: str, obj: Dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = dict(obj)
+    payload.setdefault("timestamp", _now_str())
     with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def _plot_loss_curves(logs: List[Dict[str, Any]], out_path: str) -> None:
@@ -531,6 +563,8 @@ def train(cfg: Dict[str, Any]) -> None:
 
     latents_scaled = bool(data_cfg.get("latents_scaled", False))
     latent_divisor = float(data_cfg.get("latent_divisor", 1.0))
+    max_samples_a = int(data_cfg.get("max_samples_a", -1))
+    max_samples_b = int(data_cfg.get("max_samples_b", -1))
     _require(latent_divisor > 0, "config.data.latent_divisor must be > 0")
 
     seed = int(train_cfg.get("seed", 42))
@@ -581,8 +615,13 @@ def train(cfg: Dict[str, Any]) -> None:
 
     log_dir = str(log_cfg.get("log_dir", "outputs/logs"))
     log_file = str(log_cfg.get("log_file", "train_log.jsonl"))
+    text_log_file = str(log_cfg.get("text_log_file", "train_console.log"))
     log_path = os.path.join(log_dir, log_file)
+    text_log_path = os.path.join(log_dir, text_log_file)
     loss_plot_path = os.path.join(log_dir, "loss_curves.png")
+
+    os.makedirs(log_dir, exist_ok=True)
+    _set_active_text_log_path(text_log_path)
 
     vis_dir = str(vis_cfg.get("out_dir", "outputs/vis"))
     vis_num = int(vis_cfg.get("num_samples", 4))
@@ -597,8 +636,18 @@ def train(cfg: Dict[str, Any]) -> None:
     _ensure_dir(ckpt_dir)
 
     # data
-    dataset_a = DomainLatentDataset(a_dir, latent_divisor=latent_divisor)
-    dataset_b = DomainLatentDataset(b_dir, latent_divisor=latent_divisor)
+    dataset_a = DomainLatentDataset(
+        a_dir,
+        latent_divisor=latent_divisor,
+        max_samples=max_samples_a,
+        seed=seed,
+    )
+    dataset_b = DomainLatentDataset(
+        b_dir,
+        latent_divisor=latent_divisor,
+        max_samples=max_samples_b,
+        seed=seed,
+    )
 
     loader_a = DataLoader(
         dataset_a,
@@ -653,7 +702,7 @@ def train(cfg: Dict[str, Any]) -> None:
     sched_G = torch.optim.lr_scheduler.LambdaLR(opt_G, lr_lambda=lr_lambda)
     sched_D = torch.optim.lr_scheduler.LambdaLR(opt_D, lr_lambda=lr_lambda)
 
-    scaler = GradScaler(enabled=amp)
+    scaler = GradScaler(device.type, enabled=amp)
 
     start_step = 1
     resumed_kimg = 0.0
@@ -677,9 +726,9 @@ def train(cfg: Dict[str, Any]) -> None:
             )
             resumed_from_checkpoint = True
             start_step = loaded_step + 1
-            print(f"Resumed from checkpoint: {candidate} (step={loaded_step}, kimg={resumed_kimg:.3f})")
+            log_message(f"Resumed from checkpoint: {candidate} (step={loaded_step}, kimg={resumed_kimg:.3f})")
         else:
-            print(f"[warn] resume enabled but checkpoint not found: {candidate}. Start from scratch.")
+            log_message(f"[warn] resume enabled but checkpoint not found: {candidate}. Start from scratch.")
 
     if not resumed_from_checkpoint:
         # Init weights from N(0, 0.02) only when starting from scratch
@@ -699,7 +748,6 @@ def train(cfg: Dict[str, Any]) -> None:
     if isinstance(vis_cfg.get("vae_scaling_factor"), (float, int)):
         vae_scaling_factor = float(vis_cfg.get("vae_scaling_factor"))
 
-    os.makedirs(log_dir, exist_ok=True)
     os.makedirs(vis_dir, exist_ok=True)
 
     metric_logs_for_plot: List[Dict[str, Any]] = []
@@ -715,11 +763,13 @@ def train(cfg: Dict[str, Any]) -> None:
     log_window_start = train_start
 
     if start_step > total_steps:
-        print(
+        log_message(
             f"Checkpoint already reached or exceeded total_steps: start_step={start_step}, total_steps={total_steps}. "
             f"Nothing to do."
         )
         return
+
+    use_tqdm = sys.stderr.isatty()
 
     pbar = tqdm(
         total=total_steps,
@@ -729,6 +779,7 @@ def train(cfg: Dict[str, Any]) -> None:
         ncols=tqdm_ncols,
         ascii=True,
         bar_format=f"{{l_bar}}{{bar:{tqdm_bar_len}}}{{r_bar}}",
+        disable=not use_tqdm,
     )
 
     for step in range(start_step, total_steps + 1):
@@ -746,7 +797,7 @@ def train(cfg: Dict[str, Any]) -> None:
         # ------------------ Generators ------------------
         opt_G.zero_grad(set_to_none=True)
 
-        with autocast(enabled=amp):
+        with autocast(device_type=device.type, enabled=amp):
             fake_b = G(real_a)
             fake_a = F(real_b)
 
@@ -781,7 +832,7 @@ def train(cfg: Dict[str, Any]) -> None:
         # ------------------ Discriminators ------------------
         opt_D.zero_grad(set_to_none=True)
 
-        with autocast(enabled=amp):
+        with autocast(device_type=device.type, enabled=amp):
             # D_A
             pred_real_a = D_A(real_a)
             fake_a_for_d = fake_a_buffer.push_and_pop(fake_a)
@@ -801,10 +852,15 @@ def train(cfg: Dict[str, Any]) -> None:
             loss_d = (loss_d_a_val + loss_d_b_val) * d_loss_scale
 
         scaler.scale(loss_d).backward()
+
+        scale_before_update = scaler.get_scale() if amp else 1.0
         scaler.step(opt_D)
         scaler.update()
-        sched_G.step()
-        sched_D.step()
+        scale_after_update = scaler.get_scale() if amp else 1.0
+        should_step_scheduler = (not amp) or (scale_after_update >= scale_before_update)
+        if should_step_scheduler:
+            sched_G.step()
+            sched_D.step()
 
         # logging
         losses_g_total.append(float(loss_g.detach().cpu().item()))
@@ -820,10 +876,11 @@ def train(cfg: Dict[str, Any]) -> None:
         lr_g = float(opt_G.param_groups[0]["lr"])
         lr_d = float(opt_D.param_groups[0]["lr"])
 
-        pbar.set_postfix_str(
-            f"step {step}/{total_steps} | kimg {current_kimg:.3f} | G {losses_g_total[-1]:.3f} | D {losses_d_total[-1]:.3f}",
-            refresh=True,
-        )
+        if use_tqdm:
+            pbar.set_postfix_str(
+                f"step {step}/{total_steps} | kimg {current_kimg:.3f} | G {losses_g_total[-1]:.3f} | D {losses_d_total[-1]:.3f}",
+                refresh=True,
+            )
         pbar.update(1)
 
         should_log = (log_every_steps > 0 and step % log_every_steps == 0) or step == total_steps
@@ -857,6 +914,18 @@ def train(cfg: Dict[str, Any]) -> None:
             write_jsonl_line(log_path, metric_log)
             metric_logs_for_plot.append(metric_log)
             _plot_loss_curves(metric_logs_for_plot, loss_plot_path)
+
+            if not use_tqdm:
+                log_message(
+                    "train "
+                    f"step={step}/{total_steps} "
+                    f"kimg={current_kimg:.3f} "
+                    f"loss_G={metric_log['loss_G']:.4f} "
+                    f"loss_D={metric_log['loss_D']:.4f} "
+                    f"lr_G={lr_g:.6f} "
+                    f"lr_D={lr_d:.6f}",
+                    flush=True,
+                )
 
             losses_g_total.clear()
             losses_d_total.clear()
@@ -906,10 +975,10 @@ def train(cfg: Dict[str, Any]) -> None:
         should_visualize = vis_every_steps > 0 and step % vis_every_steps == 0
         if should_visualize:
             if not (isinstance(vae_name, str) and vae_name):
-                print("[warn] visualization.vae_model_name_or_path not set; skip visualization")
+                log_message("[warn] visualization.vae_model_name_or_path not set; skip visualization")
             else:
                 if vae is None:
-                    print("Loading VAE for visualization...")
+                    log_message("Loading VAE for visualization...")
                     vae = _load_vae(vae_name, vae_subfolder if isinstance(vae_subfolder, str) else None, device)
 
                 from torchvision.utils import make_grid, save_image  # type: ignore
@@ -960,7 +1029,7 @@ def train(cfg: Dict[str, Any]) -> None:
                 completed_kimg = step // steps_per_kimg
                 out_path = os.path.join(vis_dir, f"kimg_{completed_kimg:05d}.png")
                 save_image(grid, out_path)
-                print(f"Saved visualization: {out_path}")
+                log_message(f"Saved visualization: {out_path}")
 
     pbar.close()
 
