@@ -29,10 +29,14 @@ model:
 train:
   device: "cuda"   # "cuda" or "cpu"
   seed: 42
-  epochs: 200
   batch_size: 4
+  total_kimg: 200
   num_workers: 4
   amp: true
+
+  log_every_steps: 100
+  ckpt_every_kimg: 20
+  vis_every_kimg: 20
 
   # Checkpoints
   checkpoint_dir: "outputs/model"
@@ -50,9 +54,9 @@ train:
   beta1: 0.5
   beta2: 0.999
 
-  # LR schedule (CycleGAN paper): keep lr for 100 epochs, then linearly decay to 0 over next 100
-  lr_constant_epochs: 100
-  lr_decay_epochs: 100
+  # LR schedule: keep lr for 12.5M images, then linearly decay to 0 over next 12.5M images
+  lr_constant_kimg: 12500
+  lr_decay_kimg: 12500
 
   # Paper: "divide the objective by 2 while optimizing D"
   d_loss_scale: 0.5
@@ -73,7 +77,6 @@ logging:
   log_file: "train_log.jsonl"
 
 visualization:
-  every_epochs: 1
   out_dir: "outputs/vis"
   num_samples: 2
 

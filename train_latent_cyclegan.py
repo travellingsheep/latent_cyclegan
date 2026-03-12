@@ -5,7 +5,7 @@ import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -54,7 +54,8 @@ def _checkpoint_last_path(ckpt_dir: str) -> str:
 
 def save_checkpoint(
     ckpt_path: str,
-    epoch: int,
+    step: int,
+    current_kimg: float,
     G: nn.Module,
     F: nn.Module,
     D_A: nn.Module,
@@ -67,7 +68,8 @@ def save_checkpoint(
     cfg: Dict[str, Any],
 ) -> None:
     payload: Dict[str, Any] = {
-        "epoch": int(epoch),
+        "step": int(step),
+        "kimg": float(current_kimg),
         "G": G.state_dict(),
         "F": F.state_dict(),
         "D_A": D_A.state_dict(),
@@ -101,9 +103,9 @@ def load_checkpoint(
     sched_D: torch.optim.lr_scheduler._LRScheduler,
     scaler: GradScaler,
     restore_rng: bool = True,
-) -> int:
+) -> Tuple[int, float]:
     payload = torch.load(ckpt_path, map_location="cpu")
-    if not isinstance(payload, dict) or "epoch" not in payload:
+    if not isinstance(payload, dict):
         raise ValueError(f"Invalid checkpoint format: {ckpt_path}")
 
     def _load_discriminator_compat(module: nn.Module, sd: Any, name: str) -> None:
@@ -183,7 +185,9 @@ def load_checkpoint(
         except Exception:
             pass
 
-    return int(payload["epoch"])
+    loaded_step = int(payload.get("step", 0))
+    loaded_kimg = float(payload.get("kimg", 0.0))
+    return loaded_step, loaded_kimg
 
 
 class ReplayBuffer:
@@ -301,6 +305,15 @@ class DomainLatentDataset(Dataset):
 def collate_latents(batch: List[torch.Tensor]) -> torch.Tensor:
     # batch: list of [C,H,W]
     return torch.stack(batch, dim=0)
+
+
+def get_infinite_iterator(dataloader: DataLoader) -> Iterator[torch.Tensor]:
+    iterator = iter(dataloader)
+    while True:
+        try:
+            yield next(iterator)
+        except StopIteration:
+            iterator = iter(dataloader)
 
 
 class ResnetBlock(nn.Module):
@@ -446,12 +459,12 @@ def write_jsonl_line(path: str, obj: Dict[str, Any]) -> None:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
-def _plot_loss_curves(epoch_logs: List[Dict[str, Any]], out_path: str) -> None:
-    """Plot loss curves vs epoch and save to out_path.
+def _plot_loss_curves(logs: List[Dict[str, Any]], out_path: str) -> None:
+    """Plot loss curves vs kimg/epoch and save to out_path.
 
-    This is intentionally lightweight: it overwrites a single PNG each epoch.
+    This is intentionally lightweight: it overwrites a single PNG each time metrics are logged.
     """
-    if not epoch_logs:
+    if not logs:
         return
 
     try:
@@ -465,7 +478,7 @@ def _plot_loss_curves(epoch_logs: List[Dict[str, Any]], out_path: str) -> None:
 
     def _series(key: str) -> List[float]:
         vals: List[float] = []
-        for d in epoch_logs:
+        for d in logs:
             v = d.get(key)
             try:
                 vals.append(float(v))
@@ -473,17 +486,18 @@ def _plot_loss_curves(epoch_logs: List[Dict[str, Any]], out_path: str) -> None:
                 vals.append(float("nan"))
         return vals
 
-    epochs = [int(d.get("epoch", i + 1)) for i, d in enumerate(epoch_logs)]
+    use_kimg = any("kimg" in d for d in logs)
+    x_vals = [float(d.get("kimg", i + 1)) if use_kimg else float(d.get("epoch", i + 1)) for i, d in enumerate(logs)]
 
     plt.figure(figsize=(10, 6))
-    plt.plot(epochs, _series("loss_G"), label="G total")
-    plt.plot(epochs, _series("loss_D"), label="D total")
-    plt.plot(epochs, _series("loss_gan_G"), label="GAN(G)")
-    plt.plot(epochs, _series("loss_gan_F"), label="GAN(F)")
-    plt.plot(epochs, _series("loss_cyc"), label="cycle")
-    plt.plot(epochs, _series("loss_id"), label="identity")
+    plt.plot(x_vals, _series("loss_G"), label="G total")
+    plt.plot(x_vals, _series("loss_D"), label="D total")
+    plt.plot(x_vals, _series("loss_gan_G"), label="GAN(G)")
+    plt.plot(x_vals, _series("loss_gan_F"), label="GAN(F)")
+    plt.plot(x_vals, _series("loss_cyc"), label="cycle")
+    plt.plot(x_vals, _series("loss_id"), label="identity")
 
-    plt.xlabel("epoch")
+    plt.xlabel("kimg" if use_kimg else "epoch")
     plt.ylabel("loss")
     plt.title("Training loss curves")
     plt.grid(True, alpha=0.3)
@@ -531,7 +545,7 @@ def train(cfg: Dict[str, Any]) -> None:
     num_workers = int(train_cfg.get("num_workers", 4))
     amp = bool(train_cfg.get("amp", True)) and device.type == "cuda"
 
-    epochs = int(train_cfg.get("epochs", 50))
+    total_kimg = int(train_cfg.get("total_kimg", 25000))
     lr = float(train_cfg.get("lr", 2e-4))
     beta1 = float(train_cfg.get("beta1", 0.5))
     beta2 = float(train_cfg.get("beta2", 0.999))
@@ -542,12 +556,25 @@ def train(cfg: Dict[str, Any]) -> None:
     # Paper: "divide the objective by 2 while optimizing D"
     d_loss_scale = float(train_cfg.get("d_loss_scale", 0.5))
 
-    # LR schedule: keep for N epochs, then linearly decay to 0 over next M epochs
-    lr_constant_epochs = int(train_cfg.get("lr_constant_epochs", 100))
-    lr_decay_epochs = int(train_cfg.get("lr_decay_epochs", 100))
+    log_every_steps = int(train_cfg.get("log_every_steps", 100))
+    ckpt_every_kimg = int(train_cfg.get("ckpt_every_kimg", 1000))
+    vis_every_kimg = int(train_cfg.get("vis_every_kimg", 500))
+
+    lr_constant_kimg = int(train_cfg.get("lr_constant_kimg", 12500))
+    lr_decay_kimg = int(train_cfg.get("lr_decay_kimg", 12500))
 
     fake_buffer_size = int(train_cfg.get("fake_buffer_size", 50))
     fake_buffer_prob = float(train_cfg.get("fake_buffer_prob", 0.5))
+
+    _require(batch_size > 0, "config.train.batch_size must be > 0")
+    _require(total_kimg > 0, "config.train.total_kimg must be > 0")
+    steps_per_kimg = int(1000 / batch_size)
+    _require(steps_per_kimg > 0, "config.train.batch_size must be <= 1000 to produce steps_per_kimg >= 1")
+    total_steps = int(total_kimg * 1000 / batch_size)
+    _require(total_steps > 0, "config.train.total_steps computed from total_kimg and batch_size must be > 0")
+
+    ckpt_every_steps = ckpt_every_kimg * steps_per_kimg if ckpt_every_kimg > 0 else 0
+    vis_every_steps = vis_every_kimg * steps_per_kimg if vis_every_kimg > 0 else 0
 
     tqdm_ncols = int(log_cfg.get("tqdm_ncols", 120))
     tqdm_bar_len = int(log_cfg.get("tqdm_bar_len", 30))
@@ -557,7 +584,6 @@ def train(cfg: Dict[str, Any]) -> None:
     log_path = os.path.join(log_dir, log_file)
     loss_plot_path = os.path.join(log_dir, "loss_curves.png")
 
-    vis_every = int(vis_cfg.get("every_epochs", 5))
     vis_dir = str(vis_cfg.get("out_dir", "outputs/vis"))
     vis_num = int(vis_cfg.get("num_samples", 4))
 
@@ -593,6 +619,9 @@ def train(cfg: Dict[str, Any]) -> None:
         collate_fn=collate_latents,
     )
 
+    loader_a_iter = get_infinite_iterator(loader_a)
+    loader_b_iter = get_infinite_iterator(loader_b)
+
     in_ch = int(model_cfg.get("in_channels", 4))
     out_ch = int(model_cfg.get("out_channels", 4))
     ngf = int(model_cfg.get("ngf", 32))
@@ -612,13 +641,13 @@ def train(cfg: Dict[str, Any]) -> None:
     opt_G = torch.optim.Adam(list(G.parameters()) + list(F.parameters()), lr=lr, betas=(beta1, beta2))
     opt_D = torch.optim.Adam(list(D_A.parameters()) + list(D_B.parameters()), lr=lr, betas=(beta1, beta2))
 
-    def lr_lambda(epoch_idx0: int) -> float:
-        # epoch_idx0: 0-based
-        if lr_decay_epochs <= 0:
+    def lr_lambda(step: int) -> float:
+        current_kimg = step * batch_size / 1000.0
+        if lr_decay_kimg <= 0:
             return 1.0
-        if epoch_idx0 < lr_constant_epochs:
+        if current_kimg <= lr_constant_kimg:
             return 1.0
-        t = (epoch_idx0 - lr_constant_epochs + 1) / float(lr_decay_epochs)
+        t = (current_kimg - lr_constant_kimg) / float(lr_decay_kimg)
         return max(0.0, 1.0 - t)
 
     sched_G = torch.optim.lr_scheduler.LambdaLR(opt_G, lr_lambda=lr_lambda)
@@ -626,11 +655,13 @@ def train(cfg: Dict[str, Any]) -> None:
 
     scaler = GradScaler(enabled=amp)
 
-    start_epoch = 1
+    start_step = 1
+    resumed_kimg = 0.0
+    resumed_from_checkpoint = False
     if resume:
         candidate = resume_path if resume_path else _checkpoint_last_path(ckpt_dir)
         if os.path.exists(candidate):
-            loaded_epoch = load_checkpoint(
+            loaded_step, resumed_kimg = load_checkpoint(
                 candidate,
                 device=device,
                 G=G,
@@ -644,12 +675,13 @@ def train(cfg: Dict[str, Any]) -> None:
                 scaler=scaler,
                 restore_rng=restore_rng,
             )
-            start_epoch = loaded_epoch + 1
-            print(f"Resumed from checkpoint: {candidate} (epoch={loaded_epoch})")
+            resumed_from_checkpoint = True
+            start_step = loaded_step + 1
+            print(f"Resumed from checkpoint: {candidate} (step={loaded_step}, kimg={resumed_kimg:.3f})")
         else:
             print(f"[warn] resume enabled but checkpoint not found: {candidate}. Start from scratch.")
 
-    if start_epoch == 1:
+    if not resumed_from_checkpoint:
         # Init weights from N(0, 0.02) only when starting from scratch
         G.apply(init_weights_normal)
         F.apply(init_weights_normal)
@@ -667,202 +699,212 @@ def train(cfg: Dict[str, Any]) -> None:
     if isinstance(vis_cfg.get("vae_scaling_factor"), (float, int)):
         vae_scaling_factor = float(vis_cfg.get("vae_scaling_factor"))
 
-    fixed_a_paths = dataset_a.paths[:vis_num]
-    fixed_b_paths = dataset_b.paths[:vis_num]
-
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(vis_dir, exist_ok=True)
 
-    epoch_logs_for_plot: List[Dict[str, Any]] = []
+    metric_logs_for_plot: List[Dict[str, Any]] = []
+    losses_g_total: List[float] = []
+    losses_d_total: List[float] = []
+    losses_g_gan: List[float] = []
+    losses_f_gan: List[float] = []
+    losses_cyc: List[float] = []
+    losses_id: List[float] = []
+    losses_d_a: List[float] = []
+    losses_d_b: List[float] = []
+    train_start = time.time()
+    log_window_start = train_start
 
-    for epoch in range(start_epoch, epochs + 1):
-        epoch_start = time.time()
-        print(f"\nEpoch {epoch}/{epochs}")
-
-        lr_g = float(opt_G.param_groups[0]["lr"])
-        lr_d = float(opt_D.param_groups[0]["lr"])
-
-        losses_g_total: List[float] = []
-        losses_d_total: List[float] = []
-        losses_g_gan: List[float] = []
-        losses_f_gan: List[float] = []
-        losses_cyc: List[float] = []
-        losses_id: List[float] = []
-        losses_d_a: List[float] = []
-        losses_d_b: List[float] = []
-
-        iter_b = iter(loader_b)
-
-        pbar = tqdm(
-            total=len(loader_a),
-            desc=f"epoch {epoch}",
-            dynamic_ncols=False,
-            ncols=tqdm_ncols,
-            ascii=True,
-            bar_format=f"{{l_bar}}{{bar:{tqdm_bar_len}}}{{r_bar}}",
+    if start_step > total_steps:
+        print(
+            f"Checkpoint already reached or exceeded total_steps: start_step={start_step}, total_steps={total_steps}. "
+            f"Nothing to do."
         )
+        return
 
-        for _step, real_a in enumerate(loader_a, start=1):
-            try:
-                real_b = next(iter_b)
-            except StopIteration:
-                iter_b = iter(loader_b)
-                real_b = next(iter_b)
+    pbar = tqdm(
+        total=total_steps,
+        initial=start_step - 1,
+        desc="training",
+        dynamic_ncols=False,
+        ncols=tqdm_ncols,
+        ascii=True,
+        bar_format=f"{{l_bar}}{{bar:{tqdm_bar_len}}}{{r_bar}}",
+    )
 
-            real_a = real_a.to(device, non_blocking=True)
-            real_b = real_b.to(device, non_blocking=True)
+    for step in range(start_step, total_steps + 1):
+        real_a = next(loader_a_iter)
+        real_b = next(loader_b_iter)
 
-            ones_a = None
-            zeros_a = None
-            ones_b = None
-            zeros_b = None
+        real_a = real_a.to(device, non_blocking=True)
+        real_b = real_b.to(device, non_blocking=True)
 
-            # ------------------ Generators ------------------
-            opt_G.zero_grad(set_to_none=True)
+        ones_a = None
+        zeros_a = None
+        ones_b = None
+        zeros_b = None
 
-            with autocast(enabled=amp):
-                fake_b = G(real_a)
-                fake_a = F(real_b)
+        # ------------------ Generators ------------------
+        opt_G.zero_grad(set_to_none=True)
 
-                rec_a = F(fake_b)
-                rec_b = G(fake_a)
+        with autocast(enabled=amp):
+            fake_b = G(real_a)
+            fake_a = F(real_b)
 
-                pred_fake_b = D_B(fake_b)
-                pred_fake_a = D_A(fake_a)
+            rec_a = F(fake_b)
+            rec_b = G(fake_a)
 
-                ones_b = torch.ones_like(pred_fake_b)
-                ones_a = torch.ones_like(pred_fake_a)
+            pred_fake_b = D_B(fake_b)
+            pred_fake_a = D_A(fake_a)
 
-                loss_g_gan = criterion_gan(pred_fake_b, ones_b)
-                loss_f_gan = criterion_gan(pred_fake_a, ones_a)
+            ones_b = torch.ones_like(pred_fake_b)
+            ones_a = torch.ones_like(pred_fake_a)
 
-                loss_cycle = criterion_cyc(rec_a, real_a) + criterion_cyc(rec_b, real_b)
+            loss_g_gan = criterion_gan(pred_fake_b, ones_b)
+            loss_f_gan = criterion_gan(pred_fake_a, ones_a)
 
-                if lambda_id > 0:
-                    # Identity mapping: G(B)≈B and F(A)≈A
-                    id_b = G(real_b)
-                    id_a = F(real_a)
-                    loss_identity = criterion_cyc(id_b, real_b) + criterion_cyc(id_a, real_a)
-                else:
-                    loss_identity = torch.zeros((), device=device, dtype=fake_a.dtype)
+            loss_cycle = criterion_cyc(rec_a, real_a) + criterion_cyc(rec_b, real_b)
 
-                # Common CycleGAN practice: scale identity by lambda_cyc as well
-                loss_g = loss_g_gan + loss_f_gan + lambda_cyc * loss_cycle + (lambda_cyc * lambda_id) * loss_identity
+            if lambda_id > 0:
+                # Identity mapping: G(B)≈B and F(A)≈A
+                id_b = G(real_b)
+                id_a = F(real_a)
+                loss_identity = criterion_cyc(id_b, real_b) + criterion_cyc(id_a, real_a)
+            else:
+                loss_identity = torch.zeros((), device=device, dtype=fake_a.dtype)
 
-            scaler.scale(loss_g).backward()
-            scaler.step(opt_G)
+            # Common CycleGAN practice: scale identity by lambda_cyc as well
+            loss_g = loss_g_gan + loss_f_gan + lambda_cyc * loss_cycle + (lambda_cyc * lambda_id) * loss_identity
 
-            # ------------------ Discriminators ------------------
-            opt_D.zero_grad(set_to_none=True)
+        scaler.scale(loss_g).backward()
+        scaler.step(opt_G)
 
-            with autocast(enabled=amp):
-                # D_A
-                pred_real_a = D_A(real_a)
-                fake_a_for_d = fake_a_buffer.push_and_pop(fake_a)
-                pred_fake_a_det = D_A(fake_a_for_d)
-                zeros_a = torch.zeros_like(pred_fake_a_det)
-                ones_a = torch.ones_like(pred_real_a)
-                loss_d_a_val = 0.5 * (criterion_gan(pred_real_a, ones_a) + criterion_gan(pred_fake_a_det, zeros_a))
+        # ------------------ Discriminators ------------------
+        opt_D.zero_grad(set_to_none=True)
 
-                # D_B
-                pred_real_b = D_B(real_b)
-                fake_b_for_d = fake_b_buffer.push_and_pop(fake_b)
-                pred_fake_b_det = D_B(fake_b_for_d)
-                zeros_b = torch.zeros_like(pred_fake_b_det)
-                ones_b = torch.ones_like(pred_real_b)
-                loss_d_b_val = 0.5 * (criterion_gan(pred_real_b, ones_b) + criterion_gan(pred_fake_b_det, zeros_b))
+        with autocast(enabled=amp):
+            # D_A
+            pred_real_a = D_A(real_a)
+            fake_a_for_d = fake_a_buffer.push_and_pop(fake_a)
+            pred_fake_a_det = D_A(fake_a_for_d)
+            zeros_a = torch.zeros_like(pred_fake_a_det)
+            ones_a = torch.ones_like(pred_real_a)
+            loss_d_a_val = 0.5 * (criterion_gan(pred_real_a, ones_a) + criterion_gan(pred_fake_a_det, zeros_a))
 
-                loss_d = (loss_d_a_val + loss_d_b_val) * d_loss_scale
+            # D_B
+            pred_real_b = D_B(real_b)
+            fake_b_for_d = fake_b_buffer.push_and_pop(fake_b)
+            pred_fake_b_det = D_B(fake_b_for_d)
+            zeros_b = torch.zeros_like(pred_fake_b_det)
+            ones_b = torch.ones_like(pred_real_b)
+            loss_d_b_val = 0.5 * (criterion_gan(pred_real_b, ones_b) + criterion_gan(pred_fake_b_det, zeros_b))
 
-            scaler.scale(loss_d).backward()
-            scaler.step(opt_D)
-            scaler.update()
+            loss_d = (loss_d_a_val + loss_d_b_val) * d_loss_scale
 
-            # logging
-            losses_g_total.append(float(loss_g.detach().cpu().item()))
-            losses_d_total.append(float(loss_d.detach().cpu().item()))
-            losses_g_gan.append(float(loss_g_gan.detach().cpu().item()))
-            losses_f_gan.append(float(loss_f_gan.detach().cpu().item()))
-            losses_cyc.append(float(loss_cycle.detach().cpu().item()))
-            losses_id.append(float(loss_identity.detach().cpu().item()))
-            losses_d_a.append(float(loss_d_a_val.detach().cpu().item()))
-            losses_d_b.append(float(loss_d_b_val.detach().cpu().item()))
-
-            pbar.set_postfix_str(
-                f"G {losses_g_total[-1]:.3f} | D {losses_d_total[-1]:.3f} | cyc {losses_cyc[-1]:.3f} | id {losses_id[-1]:.3f}",
-                refresh=True,
-            )
-            pbar.update(1)
-
-        pbar.close()
-
-        epoch_time = time.time() - epoch_start
-        epoch_log = {
-            "epoch": epoch,
-            "epochs": epochs,
-            "time_sec": epoch_time,
-            "loss_G": _mean(losses_g_total),
-            "loss_D": _mean(losses_d_total),
-            "loss_gan_G": _mean(losses_g_gan),
-            "loss_gan_F": _mean(losses_f_gan),
-            "loss_cyc": _mean(losses_cyc),
-            "loss_id": _mean(losses_id),
-            "loss_D_A": _mean(losses_d_a),
-            "loss_D_B": _mean(losses_d_b),
-            "lr_G": lr_g,
-            "lr_D": lr_d,
-            "lambda_cyc": lambda_cyc,
-            "lambda_id": lambda_id,
-            "d_loss_scale": d_loss_scale,
-            "lr_constant_epochs": lr_constant_epochs,
-            "lr_decay_epochs": lr_decay_epochs,
-            "latents_scaled": latents_scaled,
-            "latent_divisor": latent_divisor,
-        }
-        write_jsonl_line(log_path, epoch_log)
-
-        # Update loss curve plot once per epoch.
-        epoch_logs_for_plot.append(epoch_log)
-        _plot_loss_curves(epoch_logs_for_plot, loss_plot_path)
-
-        # Step schedulers per-epoch (after logging this epoch)
+        scaler.scale(loss_d).backward()
+        scaler.step(opt_D)
+        scaler.update()
         sched_G.step()
         sched_D.step()
 
-        # save checkpoint each epoch
-        epoch_ckpt_path = os.path.join(ckpt_dir, f"epoch_{epoch:04d}.pt")
-        save_checkpoint(
-            ckpt_path=epoch_ckpt_path,
-            epoch=epoch,
-            G=G,
-            F=F,
-            D_A=D_A,
-            D_B=D_B,
-            opt_G=opt_G,
-            opt_D=opt_D,
-            sched_G=sched_G,
-            sched_D=sched_D,
-            scaler=scaler,
-            cfg=cfg,
-        )
-        # also update last.pt for easy resume
-        save_checkpoint(
-            ckpt_path=_checkpoint_last_path(ckpt_dir),
-            epoch=epoch,
-            G=G,
-            F=F,
-            D_A=D_A,
-            D_B=D_B,
-            opt_G=opt_G,
-            opt_D=opt_D,
-            sched_G=sched_G,
-            sched_D=sched_D,
-            scaler=scaler,
-            cfg=cfg,
-        )
+        # logging
+        losses_g_total.append(float(loss_g.detach().cpu().item()))
+        losses_d_total.append(float(loss_d.detach().cpu().item()))
+        losses_g_gan.append(float(loss_g_gan.detach().cpu().item()))
+        losses_f_gan.append(float(loss_f_gan.detach().cpu().item()))
+        losses_cyc.append(float(loss_cycle.detach().cpu().item()))
+        losses_id.append(float(loss_identity.detach().cpu().item()))
+        losses_d_a.append(float(loss_d_a_val.detach().cpu().item()))
+        losses_d_b.append(float(loss_d_b_val.detach().cpu().item()))
 
-        # visualization every N epochs
-        if vis_every > 0 and (epoch % vis_every == 0):
+        current_kimg = step * batch_size / 1000.0
+        lr_g = float(opt_G.param_groups[0]["lr"])
+        lr_d = float(opt_D.param_groups[0]["lr"])
+
+        pbar.set_postfix_str(
+            f"step {step}/{total_steps} | kimg {current_kimg:.3f} | G {losses_g_total[-1]:.3f} | D {losses_d_total[-1]:.3f}",
+            refresh=True,
+        )
+        pbar.update(1)
+
+        should_log = (log_every_steps > 0 and step % log_every_steps == 0) or step == total_steps
+        if should_log:
+            metric_log = {
+                "step": step,
+                "total_steps": total_steps,
+                "kimg": current_kimg,
+                "total_kimg": total_kimg,
+                "steps_per_kimg": steps_per_kimg,
+                "time_sec": time.time() - log_window_start,
+                "elapsed_total_sec": time.time() - train_start,
+                "loss_G": _mean(losses_g_total),
+                "loss_D": _mean(losses_d_total),
+                "loss_gan_G": _mean(losses_g_gan),
+                "loss_gan_F": _mean(losses_f_gan),
+                "loss_cyc": _mean(losses_cyc),
+                "loss_id": _mean(losses_id),
+                "loss_D_A": _mean(losses_d_a),
+                "loss_D_B": _mean(losses_d_b),
+                "lr_G": lr_g,
+                "lr_D": lr_d,
+                "lambda_cyc": lambda_cyc,
+                "lambda_id": lambda_id,
+                "d_loss_scale": d_loss_scale,
+                "lr_constant_kimg": lr_constant_kimg,
+                "lr_decay_kimg": lr_decay_kimg,
+                "latents_scaled": latents_scaled,
+                "latent_divisor": latent_divisor,
+            }
+            write_jsonl_line(log_path, metric_log)
+            metric_logs_for_plot.append(metric_log)
+            _plot_loss_curves(metric_logs_for_plot, loss_plot_path)
+
+            losses_g_total.clear()
+            losses_d_total.clear()
+            losses_g_gan.clear()
+            losses_f_gan.clear()
+            losses_cyc.clear()
+            losses_id.clear()
+            losses_d_a.clear()
+            losses_d_b.clear()
+            log_window_start = time.time()
+
+        should_save_ckpt = (ckpt_every_steps > 0 and step % ckpt_every_steps == 0) or step == total_steps
+        if should_save_ckpt:
+            completed_kimg = step // steps_per_kimg
+            ckpt_path = os.path.join(ckpt_dir, f"kimg_{completed_kimg:05d}.pt")
+            save_checkpoint(
+                ckpt_path=ckpt_path,
+                step=step,
+                current_kimg=current_kimg,
+                G=G,
+                F=F,
+                D_A=D_A,
+                D_B=D_B,
+                opt_G=opt_G,
+                opt_D=opt_D,
+                sched_G=sched_G,
+                sched_D=sched_D,
+                scaler=scaler,
+                cfg=cfg,
+            )
+            save_checkpoint(
+                ckpt_path=_checkpoint_last_path(ckpt_dir),
+                step=step,
+                current_kimg=current_kimg,
+                G=G,
+                F=F,
+                D_A=D_A,
+                D_B=D_B,
+                opt_G=opt_G,
+                opt_D=opt_D,
+                sched_G=sched_G,
+                sched_D=sched_D,
+                scaler=scaler,
+                cfg=cfg,
+            )
+
+        should_visualize = vis_every_steps > 0 and step % vis_every_steps == 0
+        if should_visualize:
             if not (isinstance(vae_name, str) and vae_name):
                 print("[warn] visualization.vae_model_name_or_path not set; skip visualization")
             else:
@@ -915,9 +957,12 @@ def train(cfg: Dict[str, Any]) -> None:
                     tiles += [a_img[i], fake_b_img[i], b_img[i], fake_a_img[i]]
 
                 grid = make_grid(torch.stack(tiles, dim=0), nrow=4)
-                out_path = os.path.join(vis_dir, f"epoch_{epoch:04d}.png")
+                completed_kimg = step // steps_per_kimg
+                out_path = os.path.join(vis_dir, f"kimg_{completed_kimg:05d}.png")
                 save_image(grid, out_path)
                 print(f"Saved visualization: {out_path}")
+
+    pbar.close()
 
 
 def main() -> None:
