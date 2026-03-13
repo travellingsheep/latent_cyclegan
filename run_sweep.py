@@ -337,11 +337,11 @@ def main() -> None:
             print_summary_table(results)
             continue
 
-            print()
-            sweep_log("=" * 100)
-            sweep_log(f"Sweep finished. Summary saved to: {summary_path}")
-            print_summary_table(results)
-            sweep_log("=" * 100)
+    print()
+    sweep_log("=" * 100)
+    sweep_log(f"Sweep finished. Summary saved to: {summary_path}")
+    print_summary_table(results)
+    sweep_log("=" * 100)
 
 
 if __name__ == "__main__":
