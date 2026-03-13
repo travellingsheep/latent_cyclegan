@@ -96,39 +96,6 @@ visualization:
   vae_subfolder: "vae"
   vae_scaling_factor: 0.18215
 
-# Evaluation config for eval_latent_cyclegan.py
-eval:
-  # If empty, evaluator will use {train.checkpoint_dir}/last.pt
-  checkpoint_path: ""
-  out_dir: "../../latent_cyclegan_outputs/eval"
-  # Default test image dirs in this repo
-  testA_dir: "../../projects/datasets/test_image_datasets/monet"
-  testB_dir: "../../projects/datasets/test_image_datasets/monet"
-
-  # Optional: CLIP config (transformers)
-  clip_model_id: "openai/clip-vit-base-patch32"
-  clip_cache_dir: ""
-  clip_local_files_only: false
-  clip_use_safetensors: true
-
-  # Optional: write relative paths in metrics.csv and store roots in metrics_paths.json
-  compact_paths: false
-
-  # Metrics & speed
-  image_size: 256
-  batch_size: 8
-  max_src_samples: 0
-  max_ref_cache: 256
-  max_ref_compare: 50
-  cache_dir: "../../latent_cyclegan_outputs/eval_cache"
-  force_regen_cache: false
-
-  save_images: true
-  disable_lpips: false
-  disable_clip: false
-  amp_bf16: true
-  device: "cuda"
-
 # Evaluation config for eval_cyclegan_yaml.py (original image-space CycleGAN)
 cyclegan_eval:
   # Where the original repo stores checkpoints: {checkpoints_dir}/{name}/{epoch}_net_G_A.pth
@@ -137,6 +104,18 @@ cyclegan_eval:
   epoch: "latest"
 
   out_dir: "../../latent_cyclegan_outputs/eval_cyclegan"
+  # Optional explicit checkpoint path for evaluate_latent.py.
+  # If empty, fallback to {train.checkpoint_dir}/last.pt
+  checkpoint_path: ""
+
+  # For latent-space evaluator (evaluate_latent.py)
+  # latent_src_dir can override data.a_dir when provided.
+  latent_src_dir: ""
+  # orig_rgb_dir can override testA_dir when provided.
+  orig_rgb_dir: ""
+  # Required for 3-panel visualization if not provided via CLI.
+  vae_recon_dir: ""
+
   testA_dir: "../../projects/datasets/monet2photo/testA"
   testB_dir: "../../projects/datasets/monet2photo/testB"
 
@@ -145,6 +124,8 @@ cyclegan_eval:
   max_src_samples: 0
   max_ref_cache: 256
   max_ref_compare: 100
+  kid_subsets: 100
+  kid_subset_size: 1000
   cache_dir: "../../latent_cyclegan_outputs/eval_cache_cyclegan"
   force_regen_cache: false
 
