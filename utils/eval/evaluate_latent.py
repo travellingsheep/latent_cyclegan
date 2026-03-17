@@ -39,18 +39,33 @@ class EvalConfig:
     data_cfg: Dict[str, Any]
     vis_cfg: Dict[str, Any]
     eval_cfg: Dict[str, Any]
-    latent_src_dir: Path
-    orig_rgb_dir: Path
-    vae_recon_dir: Path
-    testB_dir: Path
+    domain_A_name: str
+    domain_B_name: str
+    base_latent_dir: Path
+    base_orig_rgb_dir: Path
+    base_vae_recon_dir: Path
     out_dir: Path
     cache_dir: Path
     checkpoint_dir: Path
     checkpoint_path: Path
+    max_eval_samples: int
+    eval_seed: int
     image_size: int
     batch_size: int
     device: torch.device
     amp_bf16: bool
+
+
+@dataclass
+class EvalDirection:
+    name: str
+    src_domain: str
+    tgt_domain: str
+    latent_src_dir: Path
+    orig_rgb_dir: Path
+    vae_recon_dir: Path
+    tgt_ref_dir: Path
+    out_dir: Path
 
 
 def _warn(msg: str) -> None:
@@ -100,6 +115,25 @@ def _build_stem_index(root: Path) -> Dict[str, Path]:
     for p in _list_images(root):
         index[p.stem] = p
     return index
+
+
+def _resolve_domain_dir(base_dir: Path, domain_name: str, key_name: str) -> Path:
+    path = base_dir / domain_name
+    _require(path.exists(), f"{key_name} not found for domain '{domain_name}': {path}")
+    return path
+
+
+def _select_latent_paths(
+    latent_paths: Sequence[Path],
+    max_eval_samples: int,
+    eval_seed: int,
+) -> List[Path]:
+    # Global deterministic truncation for all downstream alignment by stem.
+    selected = list(latent_paths)
+    if max_eval_samples > 0 and len(selected) > max_eval_samples:
+        rng = random.Random(eval_seed)
+        selected = rng.sample(selected, max_eval_samples)
+    return sorted(selected, key=lambda p: p.stem)
 
 
 def _load_latent(path: Path) -> torch.Tensor:
@@ -247,12 +281,45 @@ def _clip_text_feature(
     return text_feat[0].cpu()
 
 
+def _normalize_eval_cfg(eval_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize user-friendly config keys into legacy keys used internally."""
+    out = dict(eval_cfg)
+    alias_pairs = [
+        ("source_latent_pt_dir", "latent_src_dir"),
+        ("source_original_rgb_dir", "orig_rgb_dir"),
+        ("source_vae_recon_rgb_dir", "vae_recon_dir"),
+        ("target_reference_rgb_dir", "testB_dir"),
+        ("eval_output_dir", "out_dir"),
+        ("reference_cache_dir", "cache_dir"),
+        ("generator_checkpoint_path", "checkpoint_path"),
+        ("eval_image_size", "image_size"),
+        ("eval_batch_size", "batch_size"),
+        ("run_device", "device"),
+        ("use_bf16_autocast", "amp_bf16"),
+        ("ref_cache_max_images", "max_ref_cache"),
+        ("kid_ref_max_images", "max_ref_compare"),
+        ("kid_num_subsets", "kid_subsets"),
+        ("skip_lpips", "disable_lpips"),
+        ("skip_clip", "disable_clip"),
+        ("clip_backbone_id", "clip_model_id"),
+        ("clip_model_cache_dir", "clip_cache_dir"),
+        ("clip_local_only", "clip_local_files_only"),
+        ("clip_target_text_prompt", "clip_text_prompt"),
+        ("max_eval_samples", "max_eval_samples"),
+        ("eval_seed", "eval_seed"),
+    ]
+    for new_key, legacy_key in alias_pairs:
+        if legacy_key not in out and new_key in out:
+            out[legacy_key] = out[new_key]
+    return out
+
+
 def _phase0_parse_config(args: argparse.Namespace) -> EvalConfig:
     cfg = load_yaml_config(args.config)
 
     model_cfg = cfg.get("model", {})
     vis_cfg = cfg.get("visualization", {})
-    eval_cfg = cfg.get("cyclegan_eval", {})
+    eval_cfg = _normalize_eval_cfg(cfg.get("cyclegan_eval", {}))
     data_cfg = cfg.get("data", {})
 
     _require(isinstance(model_cfg, dict), "config.model must be a dict")
@@ -260,10 +327,31 @@ def _phase0_parse_config(args: argparse.Namespace) -> EvalConfig:
     _require(isinstance(eval_cfg, dict), "config.cyclegan_eval must be a dict")
     _require(isinstance(data_cfg, dict), "config.data must be a dict")
 
-    latent_src_dir = Path(args.latent_src_dir or eval_cfg.get("latent_src_dir", "") or data_cfg.get("a_dir", ""))
-    orig_rgb_dir = Path(args.orig_rgb_dir or eval_cfg.get("orig_rgb_dir", "") or eval_cfg.get("testA_dir", ""))
-    vae_recon_dir = Path(args.vae_recon_dir or eval_cfg.get("vae_recon_dir", ""))
-    testB_dir = Path(args.testB_dir or eval_cfg.get("testB_dir", ""))
+    domain_A_name = str(eval_cfg.get("domain_A_name", "") or "").strip()
+    domain_B_name = str(eval_cfg.get("domain_B_name", "") or "").strip()
+
+    # New SOTA routing mode: base_dir + domain subfolder.
+    base_latent_dir = Path(eval_cfg.get("base_latent_dir", "") or "")
+    base_orig_rgb_dir = Path(eval_cfg.get("base_orig_rgb_dir", "") or "")
+    base_vae_recon_dir = Path(eval_cfg.get("base_vae_recon_dir", "") or "")
+
+    # Backward-compat fallback for legacy one-way config.
+    if not str(base_latent_dir):
+        legacy_latent_src_dir = Path(args.latent_src_dir or eval_cfg.get("latent_src_dir", "") or data_cfg.get("a_dir", ""))
+        _require(legacy_latent_src_dir.exists(), f"legacy latent_src_dir not found: {legacy_latent_src_dir}")
+        _require(domain_A_name, "cyclegan_eval.domain_A_name is required")
+        _require(domain_B_name, "cyclegan_eval.domain_B_name is required")
+        base_latent_dir = legacy_latent_src_dir.parent
+
+    if not str(base_orig_rgb_dir):
+        legacy_orig_rgb_dir = Path(args.orig_rgb_dir or eval_cfg.get("orig_rgb_dir", "") or eval_cfg.get("testA_dir", ""))
+        _require(legacy_orig_rgb_dir.exists(), f"legacy orig_rgb_dir not found: {legacy_orig_rgb_dir}")
+        base_orig_rgb_dir = legacy_orig_rgb_dir.parent
+
+    if not str(base_vae_recon_dir):
+        legacy_vae_recon_dir = Path(args.vae_recon_dir or eval_cfg.get("vae_recon_dir", ""))
+        _require(legacy_vae_recon_dir.exists(), f"legacy vae_recon_dir not found: {legacy_vae_recon_dir}")
+        base_vae_recon_dir = legacy_vae_recon_dir.parent
 
     out_dir = Path(args.out_dir or eval_cfg.get("out_dir", "outputs/eval_latent"))
     cache_dir = Path(args.cache_dir or eval_cfg.get("cache_dir", "outputs/eval_cache_latent"))
@@ -278,16 +366,26 @@ def _phase0_parse_config(args: argparse.Namespace) -> EvalConfig:
         device_str = "cpu"
     device = torch.device(device_str)
     amp_bf16 = bool(args.amp_bf16 if args.amp_bf16 is not None else eval_cfg.get("amp_bf16", True))
+    max_eval_samples = int(eval_cfg.get("max_eval_samples", -1))
+    eval_seed = int(eval_cfg.get("eval_seed", 42))
 
-    _require(str(latent_src_dir), "latent_src_dir is required")
-    _require(str(orig_rgb_dir), "orig_rgb_dir is required")
-    _require(str(vae_recon_dir), "vae_recon_dir is required")
-    _require(str(testB_dir), "testB_dir is required")
+    _require(domain_A_name, "cyclegan_eval.domain_A_name is required")
+    _require(domain_B_name, "cyclegan_eval.domain_B_name is required")
+    _require(str(base_latent_dir), "cyclegan_eval.base_latent_dir is required")
+    _require(str(base_orig_rgb_dir), "cyclegan_eval.base_orig_rgb_dir is required")
+    _require(str(base_vae_recon_dir), "cyclegan_eval.base_vae_recon_dir is required")
 
-    _require(latent_src_dir.exists(), f"latent_src_dir not found: {latent_src_dir}")
-    _require(orig_rgb_dir.exists(), f"orig_rgb_dir not found: {orig_rgb_dir}")
-    _require(vae_recon_dir.exists(), f"vae_recon_dir not found: {vae_recon_dir}")
-    _require(testB_dir.exists(), f"testB_dir not found: {testB_dir}")
+    _require(base_latent_dir.exists(), f"base_latent_dir not found: {base_latent_dir}")
+    _require(base_orig_rgb_dir.exists(), f"base_orig_rgb_dir not found: {base_orig_rgb_dir}")
+    _require(base_vae_recon_dir.exists(), f"base_vae_recon_dir not found: {base_vae_recon_dir}")
+
+    # Validate domain subfolders for both directions in Phase 0.
+    _resolve_domain_dir(base_latent_dir, domain_A_name, "base_latent_dir")
+    _resolve_domain_dir(base_latent_dir, domain_B_name, "base_latent_dir")
+    _resolve_domain_dir(base_orig_rgb_dir, domain_A_name, "base_orig_rgb_dir")
+    _resolve_domain_dir(base_orig_rgb_dir, domain_B_name, "base_orig_rgb_dir")
+    _resolve_domain_dir(base_vae_recon_dir, domain_A_name, "base_vae_recon_dir")
+    _resolve_domain_dir(base_vae_recon_dir, domain_B_name, "base_vae_recon_dir")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -297,14 +395,17 @@ def _phase0_parse_config(args: argparse.Namespace) -> EvalConfig:
         data_cfg=data_cfg,
         vis_cfg=vis_cfg,
         eval_cfg=eval_cfg,
-        latent_src_dir=latent_src_dir,
-        orig_rgb_dir=orig_rgb_dir,
-        vae_recon_dir=vae_recon_dir,
-        testB_dir=testB_dir,
+        domain_A_name=domain_A_name,
+        domain_B_name=domain_B_name,
+        base_latent_dir=base_latent_dir,
+        base_orig_rgb_dir=base_orig_rgb_dir,
+        base_vae_recon_dir=base_vae_recon_dir,
         out_dir=out_dir,
         cache_dir=cache_dir,
         checkpoint_dir=checkpoint_dir,
         checkpoint_path=checkpoint_path,
+        max_eval_samples=max_eval_samples,
+        eval_seed=eval_seed,
         image_size=image_size,
         batch_size=batch_size,
         device=device,
@@ -312,11 +413,22 @@ def _phase0_parse_config(args: argparse.Namespace) -> EvalConfig:
     )
 
 
-def _phase1_build_or_load_ref_cache(ecfg: EvalConfig, force_regen_cache: bool = False) -> Dict[str, Any]:
+def _phase1_build_or_load_ref_cache(
+    ecfg: EvalConfig,
+    target_ref_dir: Path,
+    clip_runtime: Optional[Dict[str, Any]] = None,
+    force_regen_cache: bool = False,
+) -> Dict[str, Any]:
     from cleanfid import fid
 
-    clip_model_id, clip_model, clip_processor = _load_clip_model(ecfg.eval_cfg, ecfg.device)
-    cache_name = _get_cache_name(ecfg.testB_dir, ecfg.image_size, clip_model_id)
+    if clip_runtime is None:
+        clip_model_id, clip_model, clip_processor = _load_clip_model(ecfg.eval_cfg, ecfg.device)
+    else:
+        clip_model_id = str(clip_runtime["clip_model_id"])
+        clip_model = clip_runtime["clip_model"]
+        clip_processor = clip_runtime["clip_processor"]
+
+    cache_name = _get_cache_name(target_ref_dir, ecfg.image_size, clip_model_id)
     cache_path = ecfg.cache_dir / cache_name
 
     if cache_path.exists() and not force_regen_cache:
@@ -331,14 +443,14 @@ def _phase1_build_or_load_ref_cache(ecfg: EvalConfig, force_regen_cache: bool = 
         return cache
 
     _log("[Phase1] Building strict reference cache...")
-    ref_paths = _list_images(ecfg.testB_dir)
+    ref_paths = _list_images(target_ref_dir)
     max_ref_cache = int(ecfg.eval_cfg.get("max_ref_cache", 0))
     if max_ref_cache > 0 and len(ref_paths) > max_ref_cache:
         random.seed(42)
         ref_paths = random.sample(ref_paths, max_ref_cache)
 
     cleanfid_features = fid.get_folder_features(
-        fdir=str(ecfg.testB_dir),
+        fdir=str(target_ref_dir),
         model="inception_v3",
         mode="clean",
         num_workers=4,
@@ -370,7 +482,7 @@ def _phase1_build_or_load_ref_cache(ecfg: EvalConfig, force_regen_cache: bool = 
 
     payload: Dict[str, Any] = {
         "meta": {
-            "testB_dir": str(ecfg.testB_dir.resolve()),
+            "testB_dir": str(target_ref_dir.resolve()),
             "image_size": ecfg.image_size,
             "extractors": ["inception_v3_pool3", clip_model_id],
             "num_ref_images_cleanfid": int(cleanfid_features.shape[0]),
@@ -398,38 +510,53 @@ def _phase1_build_or_load_ref_cache(ecfg: EvalConfig, force_regen_cache: bool = 
     return payload
 
 
-def _load_generator(ecfg: EvalConfig) -> torch.nn.Module:
+def _load_generators(ecfg: EvalConfig) -> Dict[str, torch.nn.Module]:
     _require(ecfg.checkpoint_path.exists(), f"checkpoint not found: {ecfg.checkpoint_path}")
 
-    G = ResnetGenerator(
-        in_ch=int(ecfg.model_cfg.get("in_channels", 4)),
-        out_ch=int(ecfg.model_cfg.get("out_channels", 4)),
-        ngf=int(ecfg.model_cfg.get("ngf", 256)),
-        n_res_blocks=int(ecfg.model_cfg.get("n_res_blocks", 9)),
-        out_activation=str(ecfg.model_cfg.get("out_activation", "none")),
-    )
-
     payload = torch.load(ecfg.checkpoint_path, map_location="cpu")
-    sd = None
-    if isinstance(payload, dict):
-        for k in ("G", "netG_A", "generator", "state_dict"):
-            if isinstance(payload.get(k), dict):
-                sd = payload[k]
-                break
-        if sd is None and all(isinstance(v, torch.Tensor) for v in payload.values()):
-            sd = payload
-    if sd is None:
-        raise ValueError(f"Unsupported generator checkpoint structure: {ecfg.checkpoint_path}")
+    _require(isinstance(payload, dict), f"Unsupported checkpoint payload type: {type(payload)}")
 
-    missing, unexpected = G.load_state_dict(sd, strict=False)
-    if missing:
-        _warn(f"Generator state_dict missing keys: {len(missing)}")
-    if unexpected:
-        _warn(f"Generator state_dict unexpected keys: {len(unexpected)}")
+    def _make_generator() -> ResnetGenerator:
+        return ResnetGenerator(
+            in_ch=int(ecfg.model_cfg.get("in_channels", 4)),
+            out_ch=int(ecfg.model_cfg.get("out_channels", 4)),
+            ngf=int(ecfg.model_cfg.get("ngf", 256)),
+            n_res_blocks=int(ecfg.model_cfg.get("n_res_blocks", 9)),
+            out_activation=str(ecfg.model_cfg.get("out_activation", "none")),
+        )
 
-    G.to(ecfg.device)
-    G.eval()
-    return G
+    def _pick_state_dict(keys: Sequence[str]) -> Optional[Dict[str, torch.Tensor]]:
+        for k in keys:
+            sd_obj = payload.get(k)
+            if isinstance(sd_obj, dict) and all(isinstance(v, torch.Tensor) for v in sd_obj.values()):
+                return sd_obj
+        return None
+
+    sd_g = _pick_state_dict(("G", "netG_A", "generator", "state_dict"))
+    sd_f = _pick_state_dict(("F", "netG_B"))
+
+    if sd_g is None and all(isinstance(v, torch.Tensor) for v in payload.values()):
+        sd_g = payload
+    _require(sd_g is not None, f"Cannot locate A2B generator weights in: {ecfg.checkpoint_path}")
+    _require(sd_f is not None, f"Cannot locate B2A generator weights (F/netG_B) in: {ecfg.checkpoint_path}")
+
+    G = _make_generator()
+    F_gen = _make_generator()
+
+    missing_g, unexpected_g = G.load_state_dict(sd_g, strict=False)
+    missing_f, unexpected_f = F_gen.load_state_dict(sd_f, strict=False)
+    if missing_g:
+        _warn(f"G state_dict missing keys: {len(missing_g)}")
+    if unexpected_g:
+        _warn(f"G state_dict unexpected keys: {len(unexpected_g)}")
+    if missing_f:
+        _warn(f"F state_dict missing keys: {len(missing_f)}")
+    if unexpected_f:
+        _warn(f"F state_dict unexpected keys: {len(unexpected_f)}")
+
+    G.to(ecfg.device).eval()
+    F_gen.to(ecfg.device).eval()
+    return {"A2B": G, "B2A": F_gen}
 
 
 def _save_tensor_image(img: torch.Tensor, out_path: Path) -> None:
@@ -456,22 +583,27 @@ def _make_3panel(orig: Image.Image, recon: Image.Image, transfer: Image.Image, s
 
 
 @torch.no_grad()
-def _phase2_infer_and_visualize(ecfg: EvalConfig) -> Dict[str, Any]:
-    image_out_dir = ecfg.out_dir / "images"
-    vis3_out_dir = ecfg.out_dir / "vis_3panel"
+def _phase2_infer_and_visualize(
+    ecfg: EvalConfig,
+    direction: EvalDirection,
+    generator: torch.nn.Module,
+    vae,
+) -> Dict[str, Any]:
+    image_out_dir = direction.out_dir / "images"
+    vis3_out_dir = direction.out_dir / "vis_3panel"
     image_out_dir.mkdir(parents=True, exist_ok=True)
     vis3_out_dir.mkdir(parents=True, exist_ok=True)
 
-    latent_paths = _list_latents(ecfg.latent_src_dir)
-    orig_index = _build_stem_index(ecfg.orig_rgb_dir)
-    recon_index = _build_stem_index(ecfg.vae_recon_dir)
-
-    G = _load_generator(ecfg)
-    vae = _load_vae(
-        model_name_or_path=str(ecfg.vis_cfg.get("vae_model_name_or_path", "runwayml/stable-diffusion-v1-5")),
-        subfolder=str(ecfg.vis_cfg.get("vae_subfolder", "vae") or "vae"),
-        device=ecfg.device,
+    latent_paths_all = _list_latents(direction.latent_src_dir)
+    selected_latent_paths = _select_latent_paths(
+        latent_paths=latent_paths_all,
+        max_eval_samples=ecfg.max_eval_samples,
+        eval_seed=ecfg.eval_seed,
     )
+    selected_stems = [_safe_stem_name(p) for p in selected_latent_paths]
+
+    orig_index = _build_stem_index(direction.orig_rgb_dir)
+    recon_index = _build_stem_index(direction.vae_recon_dir)
 
     latents_scaled = bool(ecfg.data_cfg.get("latents_scaled", False))
     latent_divisor = float(ecfg.data_cfg.get("latent_divisor", 1.0))
@@ -480,7 +612,7 @@ def _phase2_infer_and_visualize(ecfg: EvalConfig) -> Dict[str, Any]:
     transferred_paths: List[Path] = []
     paired_stems: List[str] = []
 
-    pbar = tqdm(list(_batch_iter(latent_paths, ecfg.batch_size)), desc="Phase2 inference", ascii=True)
+    pbar = tqdm(list(_batch_iter(selected_latent_paths, ecfg.batch_size)), desc=f"[{direction.name}] Phase2 inference", ascii=True)
     for latent_batch_paths in pbar:
         stems = [_safe_stem_name(p) for p in latent_batch_paths]
         latent_tensors = [_load_latent(p) for p in latent_batch_paths]
@@ -491,7 +623,7 @@ def _phase2_infer_and_visualize(ecfg: EvalConfig) -> Dict[str, Any]:
             use_amp = ecfg.amp_bf16 and ecfg.device.type == "cuda"
             amp_dtype = torch.bfloat16 if use_amp else torch.float32
             with torch.autocast(device_type=ecfg.device.type, enabled=use_amp, dtype=amp_dtype):
-                fake_latent = G(latent_in)
+                fake_latent = generator(latent_in)
                 fake_img = decode_latents_to_images(
                     vae=vae,
                     latents=fake_latent,
@@ -509,7 +641,7 @@ def _phase2_infer_and_visualize(ecfg: EvalConfig) -> Dict[str, Any]:
             for latent_tensor in latent_tensors:
                 one = latent_tensor.unsqueeze(0).to(ecfg.device, non_blocking=True)
                 one_in = one / latent_divisor if not math.isclose(latent_divisor, 1.0) else one
-                one_fake_latent = G(one_in)
+                one_fake_latent = generator(one_in)
                 one_fake_img = decode_latents_to_images(
                     vae=vae,
                     latents=one_fake_latent,
@@ -529,7 +661,7 @@ def _phase2_infer_and_visualize(ecfg: EvalConfig) -> Dict[str, Any]:
             orig_path = orig_index.get(stem)
             recon_path = recon_index.get(stem)
             if orig_path is None or recon_path is None:
-                _warn(f"Missing stem={stem} in orig/recon dir, skip 3-panel visualization")
+                _warn(f"[{direction.name}] Missing stem={stem} in orig/recon dir, skip 3-panel visualization")
                 continue
 
             orig_img = _pil_rgb(orig_path, image_size=ecfg.image_size)
@@ -554,11 +686,13 @@ def _phase2_infer_and_visualize(ecfg: EvalConfig) -> Dict[str, Any]:
     return {
         "transferred_paths": transferred_paths,
         "transferred_dir": image_out_dir,
+        "selected_stems": selected_stems,
         "paired_stems": paired_stems,
     }
 
 def _phase3_metrics(
     ecfg: EvalConfig,
+    direction: EvalDirection,
     ref_cache: Dict[str, Any],
     phase2_outputs: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -588,7 +722,7 @@ def _phase3_metrics(
 
     max_ref_compare = int(ecfg.eval_cfg.get("max_ref_compare", 0))
     ref_feats_kid = fid.get_folder_features(
-        fdir=str(ecfg.testB_dir),
+        fdir=str(direction.tgt_ref_dir),
         model="inception_v3",
         mode="clean",
         num_workers=4,
@@ -612,9 +746,10 @@ def _phase3_metrics(
     )
 
     # Pairwise metrics.
-    orig_index = _build_stem_index(ecfg.orig_rgb_dir)
+    orig_index = _build_stem_index(direction.orig_rgb_dir)
     gen_index = _build_stem_index(transferred_dir)
-    pair_stems = sorted(set(orig_index.keys()).intersection(set(gen_index.keys())))
+    selected_stems = [str(s) for s in phase2_outputs.get("selected_stems", [])]
+    pair_stems = [s for s in selected_stems if s in orig_index and s in gen_index]
 
     lpips_vals: List[float] = []
     clip_dir_vals: List[float] = []
@@ -646,7 +781,7 @@ def _phase3_metrics(
     src_clip_feats: List[torch.Tensor] = []
     gen_clip_feats: List[torch.Tensor] = []
 
-    for batch_stems in tqdm(list(_batch_iter(pair_stems, ecfg.batch_size)), desc="Phase3 pairwise", ascii=True):
+    for batch_stems in tqdm(list(_batch_iter(pair_stems, ecfg.batch_size)), desc=f"[{direction.name}] Phase3 pairwise", ascii=True):
         orig_tensors: List[torch.Tensor] = []
         gen_tensors: List[torch.Tensor] = []
         orig_imgs: List[Image.Image] = []
@@ -725,6 +860,9 @@ def _phase3_metrics(
             clip_dir_vals.append(float(v))
 
     report = {
+        "direction": direction.name,
+        "src_domain": direction.src_domain,
+        "tgt_domain": direction.tgt_domain,
         "fid": float(fid_value),
         "kid_mean": kid_value,
         "kid_std": kid_std_value,
@@ -732,6 +870,7 @@ def _phase3_metrics(
         "clip_dir_mean": float(np.mean(clip_dir_vals)) if clip_dir_vals else None,
         "clip_style_mean": float(np.mean(clip_style_vals)) if clip_style_vals else None,
         "num_generated": len(transferred_paths),
+        "num_selected_stems": len(selected_stems),
         "num_pairs": len(rows),
         "reference_cache": ref_cache.get("cache_path", ""),
     }
@@ -741,9 +880,9 @@ def _phase3_metrics(
     }
 
 
-def _write_reports(ecfg: EvalConfig, metric_payload: Dict[str, Any]) -> None:
-    report_json = ecfg.out_dir / "metrics_report.json"
-    report_csv = ecfg.out_dir / "metrics.csv"
+def _write_reports(direction: EvalDirection, metric_payload: Dict[str, Any]) -> None:
+    report_json = direction.out_dir / f"metrics_{direction.name}.json"
+    report_csv = direction.out_dir / f"metrics_{direction.name}.csv"
 
     with open(report_json, "w", encoding="utf-8") as f:
         json.dump(metric_payload["summary"], f, indent=2, ensure_ascii=False)
@@ -756,11 +895,11 @@ def _write_reports(ecfg: EvalConfig, metric_payload: Dict[str, Any]) -> None:
         for r in rows:
             writer.writerow({k: r.get(k) for k in fields})
 
-    _log("[Phase3] Metrics summary:")
+    _log(f"[{direction.name}][Phase3] Metrics summary:")
     for k, v in metric_payload["summary"].items():
         _log(f"  - {k}: {v}")
-    _log(f"[Phase3] Saved JSON report to: {report_json}")
-    _log(f"[Phase3] Saved CSV report to: {report_csv}")
+    _log(f"[{direction.name}][Phase3] Saved JSON report to: {report_json}")
+    _log(f"[{direction.name}][Phase3] Saved CSV report to: {report_csv}")
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -786,21 +925,86 @@ def build_argparser() -> argparse.ArgumentParser:
     return p
 
 
+def _build_directions(ecfg: EvalConfig) -> List[EvalDirection]:
+    def _mk(name: str, src_domain: str, tgt_domain: str) -> EvalDirection:
+        latent_src_dir = _resolve_domain_dir(ecfg.base_latent_dir, src_domain, "base_latent_dir")
+        orig_rgb_dir = _resolve_domain_dir(ecfg.base_orig_rgb_dir, src_domain, "base_orig_rgb_dir")
+        vae_recon_dir = _resolve_domain_dir(ecfg.base_vae_recon_dir, src_domain, "base_vae_recon_dir")
+        tgt_ref_dir = _resolve_domain_dir(ecfg.base_orig_rgb_dir, tgt_domain, "base_orig_rgb_dir")
+        out_dir = ecfg.out_dir / name
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return EvalDirection(
+            name=name,
+            src_domain=src_domain,
+            tgt_domain=tgt_domain,
+            latent_src_dir=latent_src_dir,
+            orig_rgb_dir=orig_rgb_dir,
+            vae_recon_dir=vae_recon_dir,
+            tgt_ref_dir=tgt_ref_dir,
+            out_dir=out_dir,
+        )
+
+    return [
+        _mk("A2B", ecfg.domain_A_name, ecfg.domain_B_name),
+        _mk("B2A", ecfg.domain_B_name, ecfg.domain_A_name),
+    ]
+
+
 def main() -> None:
     args = build_argparser().parse_args()
 
     _log("[Phase0] Parsing YAML and applying CLI overrides...")
     ecfg = _phase0_parse_config(args)
 
-    _log("[Phase1] Strict cache pre-computation...")
-    ref_cache = _phase1_build_or_load_ref_cache(ecfg, force_regen_cache=args.force_regen_cache)
+    _log("[Setup] Loading dual generators from one checkpoint...")
+    generators = _load_generators(ecfg)
 
-    _log("[Phase2] Latent inference and 3-panel visualization...")
-    phase2_outputs = _phase2_infer_and_visualize(ecfg)
+    _log("[Setup] Loading VAE once for all directions...")
+    vae = _load_vae(
+        model_name_or_path=str(ecfg.vis_cfg.get("vae_model_name_or_path", "runwayml/stable-diffusion-v1-5")),
+        subfolder=str(ecfg.vis_cfg.get("vae_subfolder", "vae") or "vae"),
+        device=ecfg.device,
+    )
 
-    _log("[Phase3] Metric computation and aggregation...")
-    metric_payload = _phase3_metrics(ecfg, ref_cache, phase2_outputs)
-    _write_reports(ecfg, metric_payload)
+    _log("[Setup] Loading CLIP once for all directions...")
+    clip_model_id, clip_model, clip_processor = _load_clip_model(ecfg.eval_cfg, ecfg.device)
+    clip_runtime = {
+        "clip_model_id": clip_model_id,
+        "clip_model": clip_model,
+        "clip_processor": clip_processor,
+    }
+
+    directions = _build_directions(ecfg)
+    for direction in directions:
+        _log(
+            f"[{direction.name}] src={direction.src_domain} tgt={direction.tgt_domain} "
+            f"max_eval_samples={ecfg.max_eval_samples} eval_seed={ecfg.eval_seed}"
+        )
+
+        _log(f"[{direction.name}][Phase1] Strict cache pre-computation...")
+        ref_cache = _phase1_build_or_load_ref_cache(
+            ecfg=ecfg,
+            target_ref_dir=direction.tgt_ref_dir,
+            clip_runtime=clip_runtime,
+            force_regen_cache=args.force_regen_cache,
+        )
+
+        _log(f"[{direction.name}][Phase2] Latent inference and 3-panel visualization...")
+        phase2_outputs = _phase2_infer_and_visualize(
+            ecfg=ecfg,
+            direction=direction,
+            generator=generators[direction.name],
+            vae=vae,
+        )
+
+        _log(f"[{direction.name}][Phase3] Metric computation and aggregation...")
+        metric_payload = _phase3_metrics(
+            ecfg=ecfg,
+            direction=direction,
+            ref_cache=ref_cache,
+            phase2_outputs=phase2_outputs,
+        )
+        _write_reports(direction=direction, metric_payload=metric_payload)
 
 
 if __name__ == "__main__":
