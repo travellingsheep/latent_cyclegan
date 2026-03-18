@@ -3,6 +3,7 @@ import csv
 import hashlib
 import json
 import math
+import os
 import random
 import sys
 import warnings
@@ -44,16 +45,16 @@ class EvalConfig:
     base_latent_dir: Path
     base_orig_rgb_dir: Path
     base_vae_recon_dir: Path
-    out_dir: Path
-    cache_dir: Path
+    eval_output_dir: Path
+    reference_cache_dir: Path
     checkpoint_dir: Path
-    checkpoint_path: Path
+    generator_checkpoint_path: Path
     max_eval_samples: int
     eval_seed: int
-    image_size: int
-    batch_size: int
-    device: torch.device
-    amp_bf16: bool
+    eval_image_size: int
+    eval_batch_size: int
+    run_device: torch.device
+    use_bf16_autocast: bool
 
 
 @dataclass
@@ -81,8 +82,22 @@ def _require(cond: bool, msg: str) -> None:
         raise ValueError(msg)
 
 
+def _torch_load_trusted(path: Path, map_location: Any = "cpu") -> Any:
+    """Load local trusted artifacts across torch versions.
+
+    PyTorch 2.6 changed torch.load default to weights_only=True, which may
+    fail for eval caches containing numpy arrays. For locally generated files
+    in this repo, we explicitly opt into full loading.
+    """
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        # Older torch versions do not support weights_only.
+        return torch.load(path, map_location=map_location)
+
+
 def _safe_stem_name(path: Path) -> str:
-    return path.stem.replace(" ", "_")
+    return path.stem
 
 
 def _pil_rgb(path: Path, image_size: Optional[int] = None) -> Image.Image:
@@ -137,7 +152,7 @@ def _select_latent_paths(
 
 
 def _load_latent(path: Path) -> torch.Tensor:
-    obj = torch.load(path, map_location="cpu")
+    obj = _torch_load_trusted(path, map_location="cpu")
     if isinstance(obj, torch.Tensor):
         t = obj
     elif isinstance(obj, dict) and isinstance(obj.get("latent"), torch.Tensor):
@@ -150,11 +165,11 @@ def _load_latent(path: Path) -> torch.Tensor:
     return t.detach().float()
 
 
-def _get_cache_name(testB_dir: Path, image_size: int, clip_model_id: str) -> str:
-    key = f"{str(testB_dir.resolve())}|{image_size}|inception_v3_pool3|{clip_model_id}"
+def _get_cache_name(target_reference_rgb_dir: Path, eval_image_size: int, clip_backbone_id: str) -> str:
+    key = f"{str(target_reference_rgb_dir.resolve())}|{eval_image_size}|inception_v3_pool3|{clip_backbone_id}"
     md5 = hashlib.md5(key.encode("utf-8")).hexdigest()
-    clip_tag = clip_model_id.replace("/", "_").replace("-", "_")
-    return f"ref_cache_{md5}_res{image_size}_inception_v3_pool3_{clip_tag}.pt"
+    clip_tag = clip_backbone_id.replace("/", "_").replace("-", "_")
+    return f"eval_ref_cache_{md5}_res{eval_image_size}_inception_v3_pool3_{clip_tag}.pt"
 
 
 def _batch_iter(seq: Sequence[Any], batch_size: int) -> Iterable[Sequence[Any]]:
@@ -223,26 +238,52 @@ def _frechet_distance(mu1: np.ndarray, sigma1: np.ndarray, mu2: np.ndarray, sigm
 def _load_clip_model(eval_cfg: Dict[str, Any], device: torch.device):
     try:
         from transformers import CLIPModel, CLIPProcessor
+        from transformers.utils import logging as transformers_logging
     except Exception as exc:
         raise RuntimeError("Missing transformers CLIP deps. Install transformers.") from exc
 
-    clip_model_id = str(eval_cfg.get("clip_model_id", "openai/clip-vit-base-patch32"))
-    clip_cache_dir = str(eval_cfg.get("clip_cache_dir", "") or "")
-    clip_local_files_only = bool(eval_cfg.get("clip_local_files_only", False))
+    # Force-disable Hugging Face/Transformers progress bars to avoid stderr spam.
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    try:
+        transformers_logging.disable_progress_bar()
+    except Exception:
+        pass
+    try:
+        from huggingface_hub.utils import disable_progress_bars
+
+        disable_progress_bars()
+    except Exception:
+        pass
+
+    clip_backbone_id = str(eval_cfg.get("clip_backbone_id", "openai/clip-vit-base-patch32"))
+    clip_model_cache_dir = str(eval_cfg.get("clip_model_cache_dir", "") or "")
+    clip_local_only = bool(eval_cfg.get("clip_local_only", False))
     clip_use_safetensors = bool(eval_cfg.get("clip_use_safetensors", False))
 
     kwargs: Dict[str, Any] = {
-        "local_files_only": clip_local_files_only,
+        "local_files_only": clip_local_only,
     }
-    if clip_cache_dir:
-        kwargs["cache_dir"] = clip_cache_dir
+    if clip_model_cache_dir:
+        kwargs["cache_dir"] = clip_model_cache_dir
     if clip_use_safetensors:
         kwargs["use_safetensors"] = True
 
-    model = CLIPModel.from_pretrained(clip_model_id, **kwargs).to(device)
-    processor = CLIPProcessor.from_pretrained(clip_model_id, **kwargs)
+    model = CLIPModel.from_pretrained(clip_backbone_id, **kwargs).to(device)
+    processor = CLIPProcessor.from_pretrained(clip_backbone_id, **kwargs)
     model.eval()
-    return clip_model_id, model, processor
+    return clip_backbone_id, model, processor
+
+
+def _to_feature_tensor(output: Any) -> torch.Tensor:
+    if torch.is_tensor(output):
+        return output
+    if hasattr(output, "pooler_output") and torch.is_tensor(output.pooler_output):
+        return output.pooler_output
+    if hasattr(output, "last_hidden_state") and torch.is_tensor(output.last_hidden_state):
+        return output.last_hidden_state[:, 0]
+    if isinstance(output, (tuple, list)) and output and torch.is_tensor(output[0]):
+        return output[0]
+    raise TypeError(f"Unsupported CLIP output type: {type(output)}")
 
 
 @torch.no_grad()
@@ -258,7 +299,7 @@ def _clip_image_features(
         imgs = [_pil_rgb(p) for p in batch_paths]
         inputs = clip_processor(images=imgs, return_tensors="pt")
         inputs = {k: v.to(device) for k, v in inputs.items()}
-        outputs = clip_model.get_image_features(**inputs)
+        outputs = _to_feature_tensor(clip_model.get_image_features(**inputs))
         outputs = F.normalize(outputs.float(), dim=-1)
         feats.append(outputs.cpu())
         del imgs, inputs, outputs
@@ -267,59 +308,12 @@ def _clip_image_features(
     return torch.cat(feats, dim=0)
 
 
-@torch.no_grad()
-def _clip_text_feature(
-    prompt: str,
-    clip_model,
-    clip_processor,
-    device: torch.device,
-) -> torch.Tensor:
-    inputs = clip_processor(text=[prompt], return_tensors="pt", padding=True)
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    text_feat = clip_model.get_text_features(**inputs)
-    text_feat = F.normalize(text_feat.float(), dim=-1)
-    return text_feat[0].cpu()
-
-
-def _normalize_eval_cfg(eval_cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize user-friendly config keys into legacy keys used internally."""
-    out = dict(eval_cfg)
-    alias_pairs = [
-        ("source_latent_pt_dir", "latent_src_dir"),
-        ("source_original_rgb_dir", "orig_rgb_dir"),
-        ("source_vae_recon_rgb_dir", "vae_recon_dir"),
-        ("target_reference_rgb_dir", "testB_dir"),
-        ("eval_output_dir", "out_dir"),
-        ("reference_cache_dir", "cache_dir"),
-        ("generator_checkpoint_path", "checkpoint_path"),
-        ("eval_image_size", "image_size"),
-        ("eval_batch_size", "batch_size"),
-        ("run_device", "device"),
-        ("use_bf16_autocast", "amp_bf16"),
-        ("ref_cache_max_images", "max_ref_cache"),
-        ("kid_ref_max_images", "max_ref_compare"),
-        ("kid_num_subsets", "kid_subsets"),
-        ("skip_lpips", "disable_lpips"),
-        ("skip_clip", "disable_clip"),
-        ("clip_backbone_id", "clip_model_id"),
-        ("clip_model_cache_dir", "clip_cache_dir"),
-        ("clip_local_only", "clip_local_files_only"),
-        ("clip_target_text_prompt", "clip_text_prompt"),
-        ("max_eval_samples", "max_eval_samples"),
-        ("eval_seed", "eval_seed"),
-    ]
-    for new_key, legacy_key in alias_pairs:
-        if legacy_key not in out and new_key in out:
-            out[legacy_key] = out[new_key]
-    return out
-
-
 def _phase0_parse_config(args: argparse.Namespace) -> EvalConfig:
     cfg = load_yaml_config(args.config)
 
     model_cfg = cfg.get("model", {})
     vis_cfg = cfg.get("visualization", {})
-    eval_cfg = _normalize_eval_cfg(cfg.get("cyclegan_eval", {}))
+    eval_cfg = cfg.get("cyclegan_eval", {})
     data_cfg = cfg.get("data", {})
 
     _require(isinstance(model_cfg, dict), "config.model must be a dict")
@@ -330,42 +324,27 @@ def _phase0_parse_config(args: argparse.Namespace) -> EvalConfig:
     domain_A_name = str(eval_cfg.get("domain_A_name", "") or "").strip()
     domain_B_name = str(eval_cfg.get("domain_B_name", "") or "").strip()
 
-    # New SOTA routing mode: base_dir + domain subfolder.
-    base_latent_dir = Path(eval_cfg.get("base_latent_dir", "") or "")
-    base_orig_rgb_dir = Path(eval_cfg.get("base_orig_rgb_dir", "") or "")
-    base_vae_recon_dir = Path(eval_cfg.get("base_vae_recon_dir", "") or "")
+    base_latent_dir = Path(args.base_latent_dir or eval_cfg.get("base_latent_dir", "") or "")
+    base_orig_rgb_dir = Path(args.base_orig_rgb_dir or eval_cfg.get("base_orig_rgb_dir", "") or "")
+    base_vae_recon_dir = Path(args.base_vae_recon_dir or eval_cfg.get("base_vae_recon_dir", "") or "")
 
-    # Backward-compat fallback for legacy one-way config.
-    if not str(base_latent_dir):
-        legacy_latent_src_dir = Path(args.latent_src_dir or eval_cfg.get("latent_src_dir", "") or data_cfg.get("a_dir", ""))
-        _require(legacy_latent_src_dir.exists(), f"legacy latent_src_dir not found: {legacy_latent_src_dir}")
-        _require(domain_A_name, "cyclegan_eval.domain_A_name is required")
-        _require(domain_B_name, "cyclegan_eval.domain_B_name is required")
-        base_latent_dir = legacy_latent_src_dir.parent
-
-    if not str(base_orig_rgb_dir):
-        legacy_orig_rgb_dir = Path(args.orig_rgb_dir or eval_cfg.get("orig_rgb_dir", "") or eval_cfg.get("testA_dir", ""))
-        _require(legacy_orig_rgb_dir.exists(), f"legacy orig_rgb_dir not found: {legacy_orig_rgb_dir}")
-        base_orig_rgb_dir = legacy_orig_rgb_dir.parent
-
-    if not str(base_vae_recon_dir):
-        legacy_vae_recon_dir = Path(args.vae_recon_dir or eval_cfg.get("vae_recon_dir", ""))
-        _require(legacy_vae_recon_dir.exists(), f"legacy vae_recon_dir not found: {legacy_vae_recon_dir}")
-        base_vae_recon_dir = legacy_vae_recon_dir.parent
-
-    out_dir = Path(args.out_dir or eval_cfg.get("out_dir", "outputs/eval_latent"))
-    cache_dir = Path(args.cache_dir or eval_cfg.get("cache_dir", "outputs/eval_cache_latent"))
+    eval_output_dir = Path(args.eval_output_dir or eval_cfg.get("eval_output_dir", "outputs/eval_latent"))
+    reference_cache_dir = Path(args.reference_cache_dir or eval_cfg.get("reference_cache_dir", "outputs/eval_cache_latent"))
     checkpoint_dir = Path(args.checkpoint_dir or cfg.get("train", {}).get("checkpoint_dir", "outputs/model"))
-    checkpoint_path = Path(args.checkpoint_path or eval_cfg.get("checkpoint_path", "") or checkpoint_dir / "last.pt")
+    generator_checkpoint_path = Path(
+        args.generator_checkpoint_path or eval_cfg.get("generator_checkpoint_path", "") or checkpoint_dir / "last.pt"
+    )
 
-    image_size = int(args.image_size or eval_cfg.get("image_size", 256))
-    batch_size = int(args.batch_size or eval_cfg.get("batch_size", 8))
+    eval_image_size = int(args.eval_image_size or eval_cfg.get("eval_image_size", 256))
+    eval_batch_size = int(args.eval_batch_size or eval_cfg.get("eval_batch_size", 8))
 
-    device_str = str(args.device or eval_cfg.get("device", "cuda"))
+    device_str = str(args.run_device or eval_cfg.get("run_device", "cuda"))
     if device_str == "cuda" and not torch.cuda.is_available():
         device_str = "cpu"
-    device = torch.device(device_str)
-    amp_bf16 = bool(args.amp_bf16 if args.amp_bf16 is not None else eval_cfg.get("amp_bf16", True))
+    run_device = torch.device(device_str)
+    use_bf16_autocast = bool(
+        args.use_bf16_autocast if args.use_bf16_autocast is not None else eval_cfg.get("use_bf16_autocast", True)
+    )
     max_eval_samples = int(eval_cfg.get("max_eval_samples", -1))
     eval_seed = int(eval_cfg.get("eval_seed", 42))
 
@@ -387,8 +366,8 @@ def _phase0_parse_config(args: argparse.Namespace) -> EvalConfig:
     _resolve_domain_dir(base_vae_recon_dir, domain_A_name, "base_vae_recon_dir")
     _resolve_domain_dir(base_vae_recon_dir, domain_B_name, "base_vae_recon_dir")
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    eval_output_dir.mkdir(parents=True, exist_ok=True)
+    reference_cache_dir.mkdir(parents=True, exist_ok=True)
 
     return EvalConfig(
         model_cfg=model_cfg,
@@ -400,120 +379,137 @@ def _phase0_parse_config(args: argparse.Namespace) -> EvalConfig:
         base_latent_dir=base_latent_dir,
         base_orig_rgb_dir=base_orig_rgb_dir,
         base_vae_recon_dir=base_vae_recon_dir,
-        out_dir=out_dir,
-        cache_dir=cache_dir,
+        eval_output_dir=eval_output_dir,
+        reference_cache_dir=reference_cache_dir,
         checkpoint_dir=checkpoint_dir,
-        checkpoint_path=checkpoint_path,
+        generator_checkpoint_path=generator_checkpoint_path,
         max_eval_samples=max_eval_samples,
         eval_seed=eval_seed,
-        image_size=image_size,
-        batch_size=batch_size,
-        device=device,
-        amp_bf16=amp_bf16,
+        eval_image_size=eval_image_size,
+        eval_batch_size=eval_batch_size,
+        run_device=run_device,
+        use_bf16_autocast=use_bf16_autocast,
     )
 
 
 def _phase1_build_or_load_ref_cache(
     ecfg: EvalConfig,
-    target_ref_dir: Path,
+    direction: EvalDirection,
     clip_runtime: Optional[Dict[str, Any]] = None,
     force_regen_cache: bool = False,
 ) -> Dict[str, Any]:
     from cleanfid import fid
 
+    cleanfid_model = fid.build_feature_extractor(mode="clean", device=ecfg.run_device, use_dataparallel=False)
+
     if clip_runtime is None:
-        clip_model_id, clip_model, clip_processor = _load_clip_model(ecfg.eval_cfg, ecfg.device)
+        clip_model_id, clip_model, clip_processor = _load_clip_model(ecfg.eval_cfg, ecfg.run_device)
     else:
         clip_model_id = str(clip_runtime["clip_model_id"])
         clip_model = clip_runtime["clip_model"]
         clip_processor = clip_runtime["clip_processor"]
 
-    cache_name = _get_cache_name(target_ref_dir, ecfg.image_size, clip_model_id)
-    cache_path = ecfg.cache_dir / cache_name
+    def _build_or_load_domain_cache(reference_rgb_dir: Path, cache_tag: str) -> Dict[str, Any]:
+        cache_name = f"{cache_tag}_" + _get_cache_name(reference_rgb_dir, ecfg.eval_image_size, clip_model_id)
+        cache_path = ecfg.reference_cache_dir / cache_name
 
-    if cache_path.exists() and not force_regen_cache:
-        _log(f"[Phase1] Use existing strict cache: {cache_path}")
-        cache = torch.load(cache_path, map_location="cpu")
-        cache["_clip_runtime"] = {
+        if cache_path.exists() and not force_regen_cache:
+            _log(f"[Phase1] Use existing {cache_tag} cache: {cache_path}")
+            payload = _torch_load_trusted(cache_path, map_location="cpu")
+            payload["cache_path"] = str(cache_path)
+            return payload
+
+        _log(f"[Phase1] Building {cache_tag} cache: {reference_rgb_dir}")
+        ref_paths = _list_images(reference_rgb_dir)
+        ref_cache_max_images = int(ecfg.eval_cfg.get("ref_cache_max_images", 0))
+
+        num_ref_images = None
+        shuffle_ref = False
+        if ref_cache_max_images > 0:
+            num_ref_images = ref_cache_max_images
+            shuffle_ref = True
+            if len(ref_paths) > ref_cache_max_images:
+                random.seed(42)
+                ref_paths = random.sample(ref_paths, ref_cache_max_images)
+
+        cleanfid_features = fid.get_folder_features(
+            fdir=str(reference_rgb_dir),
+            model=cleanfid_model,
+            mode="clean",
+            num_workers=4,
+            num=num_ref_images,
+            shuffle=shuffle_ref,
+            seed=42,
+            batch_size=max(8, ecfg.eval_batch_size),
+            device=ecfg.run_device,
+            verbose=True,
+        )
+        cleanfid_features = np.asarray(cleanfid_features)
+        mu, sigma = _mean_cov(cleanfid_features)
+
+        clip_feats = _clip_image_features(
+            image_paths=ref_paths,
+            clip_model=clip_model,
+            clip_processor=clip_processor,
+            device=ecfg.run_device,
+            batch_size=ecfg.eval_batch_size,
+        )
+        clip_proto_img = F.normalize(clip_feats.mean(dim=0, keepdim=False), dim=0).cpu()
+
+        payload: Dict[str, Any] = {
+            "meta": {
+                "cache_tag": cache_tag,
+                "reference_rgb_dir": str(reference_rgb_dir.resolve()),
+                "eval_image_size": ecfg.eval_image_size,
+                "extractors": ["inception_v3_pool3", clip_model_id],
+                "num_ref_images_cleanfid": int(cleanfid_features.shape[0]),
+                "num_ref_images_clip": int(clip_feats.shape[0]),
+            },
+            "fid_kid": {
+                "mu": mu.astype(np.float64),
+                "sigma": sigma.astype(np.float64),
+            },
+            "clip": {
+                "image_prototype": clip_proto_img,
+            },
+            "cache_path": str(cache_path),
+        }
+        torch.save(payload, cache_path)
+        _log(f"[Phase1] {cache_tag} cache saved: {cache_path}")
+        return payload
+
+    source_cache = _build_or_load_domain_cache(direction.orig_rgb_dir, "source")
+    target_cache = _build_or_load_domain_cache(direction.tgt_ref_dir, "target")
+
+    merged_cache: Dict[str, Any] = {
+        "meta": {
+            "direction": direction.name,
+            "source_domain": direction.src_domain,
+            "target_domain": direction.tgt_domain,
+        },
+        # Distribution metrics (FID/KID) are always against target domain.
+        "fid_kid": target_cache["fid_kid"],
+        "clip": {
+            "source_image_prototype": source_cache["clip"]["image_prototype"],
+            "target_image_prototype": target_cache["clip"]["image_prototype"],
+        },
+        "cache_path": {
+            "source": source_cache.get("cache_path", ""),
+            "target": target_cache.get("cache_path", ""),
+        },
+        "_clip_runtime": {
             "clip_model_id": clip_model_id,
             "clip_model": clip_model,
             "clip_processor": clip_processor,
-        }
-        cache["cache_path"] = str(cache_path)
-        return cache
-
-    _log("[Phase1] Building strict reference cache...")
-    ref_paths = _list_images(target_ref_dir)
-    max_ref_cache = int(ecfg.eval_cfg.get("max_ref_cache", 0))
-    if max_ref_cache > 0 and len(ref_paths) > max_ref_cache:
-        random.seed(42)
-        ref_paths = random.sample(ref_paths, max_ref_cache)
-
-    cleanfid_features = fid.get_folder_features(
-        fdir=str(target_ref_dir),
-        model="inception_v3",
-        mode="clean",
-        num_workers=4,
-        batch_size=max(8, ecfg.batch_size),
-        device=ecfg.device,
-        verbose=True,
-    )
-    cleanfid_features = np.asarray(cleanfid_features)
-    mu, sigma = _mean_cov(cleanfid_features)
-
-    clip_feats = _clip_image_features(
-        image_paths=ref_paths,
-        clip_model=clip_model,
-        clip_processor=clip_processor,
-        device=ecfg.device,
-        batch_size=ecfg.batch_size,
-    )
-    clip_proto_img = F.normalize(clip_feats.mean(dim=0, keepdim=False), dim=0).cpu()
-
-    clip_text_prompt = str(ecfg.eval_cfg.get("clip_text_prompt", "") or "")
-    clip_proto_text = None
-    if clip_text_prompt:
-        clip_proto_text = _clip_text_feature(
-            prompt=clip_text_prompt,
-            clip_model=clip_model,
-            clip_processor=clip_processor,
-            device=ecfg.device,
-        )
-
-    payload: Dict[str, Any] = {
-        "meta": {
-            "testB_dir": str(target_ref_dir.resolve()),
-            "image_size": ecfg.image_size,
-            "extractors": ["inception_v3_pool3", clip_model_id],
-            "num_ref_images_cleanfid": int(cleanfid_features.shape[0]),
-            "num_ref_images_clip": int(clip_feats.shape[0]),
-            "clip_text_prompt": clip_text_prompt,
         },
-        "fid_kid": {
-            "mu": mu.astype(np.float64),
-            "sigma": sigma.astype(np.float64),
-        },
-        "clip": {
-            "image_prototype": clip_proto_img,
-            "text_prototype": clip_proto_text,
-        },
-        "cache_path": str(cache_path),
     }
-    torch.save(payload, cache_path)
-    _log(f"[Phase1] Reference cache saved: {cache_path}")
-
-    payload["_clip_runtime"] = {
-        "clip_model_id": clip_model_id,
-        "clip_model": clip_model,
-        "clip_processor": clip_processor,
-    }
-    return payload
+    return merged_cache
 
 
 def _load_generators(ecfg: EvalConfig) -> Dict[str, torch.nn.Module]:
-    _require(ecfg.checkpoint_path.exists(), f"checkpoint not found: {ecfg.checkpoint_path}")
+    _require(ecfg.generator_checkpoint_path.exists(), f"checkpoint not found: {ecfg.generator_checkpoint_path}")
 
-    payload = torch.load(ecfg.checkpoint_path, map_location="cpu")
+    payload = _torch_load_trusted(ecfg.generator_checkpoint_path, map_location="cpu")
     _require(isinstance(payload, dict), f"Unsupported checkpoint payload type: {type(payload)}")
 
     def _make_generator() -> ResnetGenerator:
@@ -537,8 +533,8 @@ def _load_generators(ecfg: EvalConfig) -> Dict[str, torch.nn.Module]:
 
     if sd_g is None and all(isinstance(v, torch.Tensor) for v in payload.values()):
         sd_g = payload
-    _require(sd_g is not None, f"Cannot locate A2B generator weights in: {ecfg.checkpoint_path}")
-    _require(sd_f is not None, f"Cannot locate B2A generator weights (F/netG_B) in: {ecfg.checkpoint_path}")
+    _require(sd_g is not None, f"Cannot locate A2B generator weights in: {ecfg.generator_checkpoint_path}")
+    _require(sd_f is not None, f"Cannot locate B2A generator weights (F/netG_B) in: {ecfg.generator_checkpoint_path}")
 
     G = _make_generator()
     F_gen = _make_generator()
@@ -554,13 +550,14 @@ def _load_generators(ecfg: EvalConfig) -> Dict[str, torch.nn.Module]:
     if unexpected_f:
         _warn(f"F state_dict unexpected keys: {len(unexpected_f)}")
 
-    G.to(ecfg.device).eval()
-    F_gen.to(ecfg.device).eval()
+    G.to(ecfg.run_device).eval()
+    F_gen.to(ecfg.run_device).eval()
     return {"A2B": G, "B2A": F_gen}
 
 
 def _save_tensor_image(img: torch.Tensor, out_path: Path) -> None:
-    img = img.detach().cpu().clamp(0, 1)
+    # ToPILImage does not support bfloat16, so force float32 on CPU.
+    img = img.detach().to(dtype=torch.float32).cpu().clamp(0, 1)
     pil = transforms.ToPILImage()(img)
     pil.save(out_path)
 
@@ -589,8 +586,8 @@ def _phase2_infer_and_visualize(
     generator: torch.nn.Module,
     vae,
 ) -> Dict[str, Any]:
-    image_out_dir = direction.out_dir / "images"
-    vis3_out_dir = direction.out_dir / "vis_3panel"
+    image_out_dir = direction.out_dir / "eval_images"
+    vis3_out_dir = direction.out_dir / "eval_vis_3panel"
     image_out_dir.mkdir(parents=True, exist_ok=True)
     vis3_out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -612,17 +609,17 @@ def _phase2_infer_and_visualize(
     transferred_paths: List[Path] = []
     paired_stems: List[str] = []
 
-    pbar = tqdm(list(_batch_iter(selected_latent_paths, ecfg.batch_size)), desc=f"[{direction.name}] Phase2 inference", ascii=True)
+    pbar = tqdm(list(_batch_iter(selected_latent_paths, ecfg.eval_batch_size)), desc=f"[{direction.name}] Phase2 inference", ascii=True)
     for latent_batch_paths in pbar:
         stems = [_safe_stem_name(p) for p in latent_batch_paths]
         latent_tensors = [_load_latent(p) for p in latent_batch_paths]
 
         try:
-            latent_batch = torch.stack(latent_tensors, dim=0).to(ecfg.device, non_blocking=True)
+            latent_batch = torch.stack(latent_tensors, dim=0).to(ecfg.run_device, non_blocking=True)
             latent_in = latent_batch / latent_divisor if not math.isclose(latent_divisor, 1.0) else latent_batch
-            use_amp = ecfg.amp_bf16 and ecfg.device.type == "cuda"
+            use_amp = ecfg.use_bf16_autocast and ecfg.run_device.type == "cuda"
             amp_dtype = torch.bfloat16 if use_amp else torch.float32
-            with torch.autocast(device_type=ecfg.device.type, enabled=use_amp, dtype=amp_dtype):
+            with torch.autocast(device_type=ecfg.run_device.type, enabled=use_amp, dtype=amp_dtype):
                 fake_latent = generator(latent_in)
                 fake_img = decode_latents_to_images(
                     vae=vae,
@@ -635,11 +632,11 @@ def _phase2_infer_and_visualize(
             if "out of memory" not in str(exc).lower():
                 raise
             _warn(f"OOM on batch size={len(latent_batch_paths)}; fallback to per-sample for this batch")
-            if ecfg.device.type == "cuda":
+            if ecfg.run_device.type == "cuda":
                 torch.cuda.empty_cache()
             fake_list: List[torch.Tensor] = []
             for latent_tensor in latent_tensors:
-                one = latent_tensor.unsqueeze(0).to(ecfg.device, non_blocking=True)
+                one = latent_tensor.unsqueeze(0).to(ecfg.run_device, non_blocking=True)
                 one_in = one / latent_divisor if not math.isclose(latent_divisor, 1.0) else one
                 one_fake_latent = generator(one_in)
                 one_fake_img = decode_latents_to_images(
@@ -664,9 +661,9 @@ def _phase2_infer_and_visualize(
                 _warn(f"[{direction.name}] Missing stem={stem} in orig/recon dir, skip 3-panel visualization")
                 continue
 
-            orig_img = _pil_rgb(orig_path, image_size=ecfg.image_size)
-            recon_img = _pil_rgb(recon_path, image_size=ecfg.image_size)
-            transfer_img = _pil_rgb(out_path, image_size=ecfg.image_size)
+            orig_img = _pil_rgb(orig_path, image_size=ecfg.eval_image_size)
+            recon_img = _pil_rgb(recon_path, image_size=ecfg.eval_image_size)
+            transfer_img = _pil_rgb(out_path, image_size=ecfg.eval_image_size)
             panel = _make_3panel(orig_img, recon_img, transfer_img, stem)
             panel.save(vis3_out_dir / f"{stem}.png")
             paired_stems.append(stem)
@@ -680,7 +677,7 @@ def _phase2_infer_and_visualize(
             del fake_latent
         if "fake_img" in locals():
             del fake_img
-        if ecfg.device.type == "cuda":
+        if ecfg.run_device.type == "cuda":
             torch.cuda.empty_cache()
 
     return {
@@ -698,8 +695,10 @@ def _phase3_metrics(
 ) -> Dict[str, Any]:
     from cleanfid import fid
 
-    disable_lpips = bool(ecfg.eval_cfg.get("disable_lpips", False))
-    disable_clip = bool(ecfg.eval_cfg.get("disable_clip", False))
+    cleanfid_model = fid.build_feature_extractor(mode="clean", device=ecfg.run_device, use_dataparallel=False)
+
+    disable_lpips = bool(ecfg.eval_cfg.get("skip_lpips", False))
+    disable_clip = bool(ecfg.eval_cfg.get("skip_clip", False))
 
     transferred_dir = Path(phase2_outputs["transferred_dir"])
     transferred_paths = _list_images(transferred_dir)
@@ -707,11 +706,11 @@ def _phase3_metrics(
     # Distribution metrics.
     gen_feats = fid.get_folder_features(
         fdir=str(transferred_dir),
-        model="inception_v3",
+        model=cleanfid_model,
         mode="clean",
         num_workers=4,
-        batch_size=max(8, ecfg.batch_size),
-        device=ecfg.device,
+        batch_size=max(8, ecfg.eval_batch_size),
+        device=ecfg.run_device,
         verbose=True,
     )
     gen_feats = np.asarray(gen_feats)
@@ -720,22 +719,22 @@ def _phase3_metrics(
     sigma_r = np.asarray(ref_cache["fid_kid"]["sigma"])
     fid_value = _frechet_distance(mu_g, sigma_g, mu_r, sigma_r)
 
-    max_ref_compare = int(ecfg.eval_cfg.get("max_ref_compare", 0))
+    max_ref_compare = int(ecfg.eval_cfg.get("kid_ref_max_images", 0))
     ref_feats_kid = fid.get_folder_features(
         fdir=str(direction.tgt_ref_dir),
-        model="inception_v3",
+        model=cleanfid_model,
         mode="clean",
         num_workers=4,
         num=(max_ref_compare if max_ref_compare > 0 else None),
         shuffle=(max_ref_compare > 0),
         seed=7,
-        batch_size=max(8, ecfg.batch_size),
-        device=ecfg.device,
+        batch_size=max(8, ecfg.eval_batch_size),
+        device=ecfg.run_device,
         verbose=True,
     )
     ref_feats_kid = np.asarray(ref_feats_kid)
 
-    kid_subsets = int(ecfg.eval_cfg.get("kid_subsets", 100))
+    kid_subsets = int(ecfg.eval_cfg.get("kid_num_subsets", 100))
     kid_subset_size = int(ecfg.eval_cfg.get("kid_subset_size", 1000))
     kid_value, kid_std_value = _kid_mean_std_from_features(
         feats_ref=ref_feats_kid,
@@ -761,42 +760,52 @@ def _phase3_metrics(
         try:
             import lpips
 
-            lpips_model = lpips.LPIPS(net="vgg").to(ecfg.device)
+            lpips_model = lpips.LPIPS(net="vgg").to(ecfg.run_device)
             lpips_model.eval()
         except Exception as exc:
             _warn(f"LPIPS disabled due to import/init error: {exc}")
 
     clip_model = None
     clip_processor = None
+    clip_source_proto = None
     clip_target_proto = None
     if not disable_clip:
         runtime = ref_cache.get("_clip_runtime", {})
         clip_model = runtime.get("clip_model")
         clip_processor = runtime.get("clip_processor")
-        clip_target_proto = ref_cache.get("clip", {}).get("image_prototype")
-        if clip_model is None or clip_processor is None or clip_target_proto is None:
+        clip_source_proto = ref_cache.get("clip", {}).get("source_image_prototype")
+        clip_target_proto = ref_cache.get("clip", {}).get("target_image_prototype")
+        if (
+            clip_model is None
+            or clip_processor is None
+            or clip_source_proto is None
+            or clip_target_proto is None
+        ):
             _warn("CLIP runtime/prototype missing in cache, CLIP metrics skipped")
             disable_clip = True
 
-    src_clip_feats: List[torch.Tensor] = []
-    gen_clip_feats: List[torch.Tensor] = []
+    style_vec = None
+    if not disable_clip and clip_source_proto is not None and clip_target_proto is not None:
+        src_proto = F.normalize(clip_source_proto.float().to(ecfg.run_device), dim=0)
+        tgt_proto = F.normalize(clip_target_proto.float().to(ecfg.run_device), dim=0)
+        style_vec = F.normalize(tgt_proto - src_proto, dim=0)
 
-    for batch_stems in tqdm(list(_batch_iter(pair_stems, ecfg.batch_size)), desc=f"[{direction.name}] Phase3 pairwise", ascii=True):
+    for batch_stems in tqdm(list(_batch_iter(pair_stems, ecfg.eval_batch_size)), desc=f"[{direction.name}] Phase3 pairwise", ascii=True):
         orig_tensors: List[torch.Tensor] = []
         gen_tensors: List[torch.Tensor] = []
         orig_imgs: List[Image.Image] = []
         gen_imgs: List[Image.Image] = []
 
         for stem in batch_stems:
-            o = _pil_rgb(orig_index[stem], ecfg.image_size)
-            g = _pil_rgb(gen_index[stem], ecfg.image_size)
+            o = _pil_rgb(orig_index[stem], ecfg.eval_image_size)
+            g = _pil_rgb(gen_index[stem], ecfg.eval_image_size)
             orig_imgs.append(o)
             gen_imgs.append(g)
             orig_tensors.append(transforms.ToTensor()(o))
             gen_tensors.append(transforms.ToTensor()(g))
 
-        orig_batch = torch.stack(orig_tensors, dim=0).to(ecfg.device)
-        gen_batch = torch.stack(gen_tensors, dim=0).to(ecfg.device)
+        orig_batch = torch.stack(orig_tensors, dim=0).to(ecfg.run_device)
+        gen_batch = torch.stack(gen_tensors, dim=0).to(ecfg.run_device)
 
         if lpips_model is not None:
             # LPIPS expects [-1, 1]
@@ -810,20 +819,27 @@ def _phase3_metrics(
         if not disable_clip and clip_model is not None and clip_processor is not None:
             inp_src = clip_processor(images=orig_imgs, return_tensors="pt")
             inp_gen = clip_processor(images=gen_imgs, return_tensors="pt")
-            inp_src = {k: v.to(ecfg.device) for k, v in inp_src.items()}
-            inp_gen = {k: v.to(ecfg.device) for k, v in inp_gen.items()}
-            feat_src = clip_model.get_image_features(**inp_src)
-            feat_gen = clip_model.get_image_features(**inp_gen)
+            inp_src = {k: v.to(ecfg.run_device) for k, v in inp_src.items()}
+            inp_gen = {k: v.to(ecfg.run_device) for k, v in inp_gen.items()}
+            feat_src = _to_feature_tensor(clip_model.get_image_features(**inp_src))
+            feat_gen = _to_feature_tensor(clip_model.get_image_features(**inp_gen))
             feat_src = F.normalize(feat_src.float(), dim=-1)
             feat_gen = F.normalize(feat_gen.float(), dim=-1)
-            src_clip_feats.append(feat_src.detach().cpu())
-            gen_clip_feats.append(feat_gen.detach().cpu())
 
             tgt = F.normalize(clip_target_proto.to(feat_gen.device).unsqueeze(0), dim=-1)
             style_vals = F.cosine_similarity(feat_gen, tgt.expand_as(feat_gen), dim=-1)
             style_cpu = style_vals.detach().cpu().tolist()
+
+            dir_cpu: List[float]
+            if style_vec is not None:
+                edit_vec = F.normalize(feat_gen - feat_src, dim=-1)
+                dir_vals = F.cosine_similarity(edit_vec, style_vec.unsqueeze(0).expand_as(edit_vec), dim=-1)
+                dir_cpu = dir_vals.detach().cpu().tolist()
+            else:
+                dir_cpu = [float("nan")] * len(batch_stems)
         else:
             style_cpu = [float("nan")] * len(batch_stems)
+            dir_cpu = [float("nan")] * len(batch_stems)
 
         for i, stem in enumerate(batch_stems):
             row = {
@@ -831,33 +847,20 @@ def _phase3_metrics(
                 "orig_path": str(orig_index[stem]),
                 "transferred_path": str(gen_index[stem]),
                 "lpips": float(lp_cpu[i]) if not math.isnan(lp_cpu[i]) else None,
-                "clip_dir": None,
+                "clip_dir": float(dir_cpu[i]) if not math.isnan(dir_cpu[i]) else None,
                 "clip_style": float(style_cpu[i]) if not math.isnan(style_cpu[i]) else None,
             }
             rows.append(row)
             if not math.isnan(lp_cpu[i]):
                 lpips_vals.append(float(lp_cpu[i]))
+            if not math.isnan(dir_cpu[i]):
+                clip_dir_vals.append(float(dir_cpu[i]))
             if not math.isnan(style_cpu[i]):
                 clip_style_vals.append(float(style_cpu[i]))
 
         del orig_batch, gen_batch
-        if ecfg.device.type == "cuda":
+        if ecfg.run_device.type == "cuda":
             torch.cuda.empty_cache()
-
-    if (not disable_clip) and src_clip_feats and gen_clip_feats and clip_target_proto is not None:
-        src_all = torch.cat(src_clip_feats, dim=0)
-        gen_all = torch.cat(gen_clip_feats, dim=0)
-        src_proto = F.normalize(src_all.mean(dim=0), dim=0)
-        tgt_proto = F.normalize(clip_target_proto.float(), dim=0)
-        style_vec = F.normalize(tgt_proto - src_proto, dim=0)
-
-        edit_vec = F.normalize(gen_all - src_all, dim=-1)
-        dir_vals = F.cosine_similarity(edit_vec, style_vec.unsqueeze(0).expand_as(edit_vec), dim=-1)
-        dir_vals_list = dir_vals.cpu().tolist()
-
-        for i, v in enumerate(dir_vals_list):
-            rows[i]["clip_dir"] = float(v)
-            clip_dir_vals.append(float(v))
 
     report = {
         "direction": direction.name,
@@ -881,8 +884,8 @@ def _phase3_metrics(
 
 
 def _write_reports(direction: EvalDirection, metric_payload: Dict[str, Any]) -> None:
-    report_json = direction.out_dir / f"metrics_{direction.name}.json"
-    report_csv = direction.out_dir / f"metrics_{direction.name}.csv"
+    report_json = direction.out_dir / f"eval_metrics_{direction.name}.json"
+    report_csv = direction.out_dir / f"eval_metrics_{direction.name}.csv"
 
     with open(report_json, "w", encoding="utf-8") as f:
         json.dump(metric_payload["summary"], f, indent=2, ensure_ascii=False)
@@ -906,21 +909,20 @@ def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Latent CycleGAN evaluation in RGB space")
     p.add_argument("--config", type=str, default="configs/example.yaml")
 
-    # Phase 0 override with highest priority.
-    p.add_argument("--orig_rgb_dir", type=str, default="", help="source-domain original RGB directory")
-    p.add_argument("--vae_recon_dir", type=str, default="", help="source-domain VAE reconstruction RGB directory")
-    p.add_argument("--latent_src_dir", type=str, default="", help="source-domain latent .pt directory")
+    # Phase 0 override with highest priority. Keep names consistent with YAML keys.
+    p.add_argument("--base_latent_dir", type=str, default="")
+    p.add_argument("--base_orig_rgb_dir", type=str, default="")
+    p.add_argument("--base_vae_recon_dir", type=str, default="")
 
-    p.add_argument("--testB_dir", type=str, default="", help="target-domain RGB directory for reference cache")
     p.add_argument("--checkpoint_dir", type=str, default="")
-    p.add_argument("--checkpoint_path", type=str, default="")
-    p.add_argument("--out_dir", type=str, default="")
-    p.add_argument("--cache_dir", type=str, default="")
-    p.add_argument("--image_size", type=int, default=0)
-    p.add_argument("--batch_size", type=int, default=0)
-    p.add_argument("--device", type=str, default="")
-    p.add_argument("--amp_bf16", action="store_true", default=None)
-    p.add_argument("--no_amp_bf16", dest="amp_bf16", action="store_false")
+    p.add_argument("--generator_checkpoint_path", type=str, default="")
+    p.add_argument("--eval_output_dir", type=str, default="")
+    p.add_argument("--reference_cache_dir", type=str, default="")
+    p.add_argument("--eval_image_size", type=int, default=0)
+    p.add_argument("--eval_batch_size", type=int, default=0)
+    p.add_argument("--run_device", type=str, default="")
+    p.add_argument("--use_bf16_autocast", action="store_true", default=None)
+    p.add_argument("--no_use_bf16_autocast", dest="use_bf16_autocast", action="store_false")
     p.add_argument("--force_regen_cache", action="store_true")
     return p
 
@@ -931,7 +933,7 @@ def _build_directions(ecfg: EvalConfig) -> List[EvalDirection]:
         orig_rgb_dir = _resolve_domain_dir(ecfg.base_orig_rgb_dir, src_domain, "base_orig_rgb_dir")
         vae_recon_dir = _resolve_domain_dir(ecfg.base_vae_recon_dir, src_domain, "base_vae_recon_dir")
         tgt_ref_dir = _resolve_domain_dir(ecfg.base_orig_rgb_dir, tgt_domain, "base_orig_rgb_dir")
-        out_dir = ecfg.out_dir / name
+        out_dir = ecfg.eval_output_dir / name
         out_dir.mkdir(parents=True, exist_ok=True)
         return EvalDirection(
             name=name,
@@ -963,11 +965,11 @@ def main() -> None:
     vae = _load_vae(
         model_name_or_path=str(ecfg.vis_cfg.get("vae_model_name_or_path", "runwayml/stable-diffusion-v1-5")),
         subfolder=str(ecfg.vis_cfg.get("vae_subfolder", "vae") or "vae"),
-        device=ecfg.device,
+        device=ecfg.run_device,
     )
 
     _log("[Setup] Loading CLIP once for all directions...")
-    clip_model_id, clip_model, clip_processor = _load_clip_model(ecfg.eval_cfg, ecfg.device)
+    clip_model_id, clip_model, clip_processor = _load_clip_model(ecfg.eval_cfg, ecfg.run_device)
     clip_runtime = {
         "clip_model_id": clip_model_id,
         "clip_model": clip_model,
@@ -984,7 +986,7 @@ def main() -> None:
         _log(f"[{direction.name}][Phase1] Strict cache pre-computation...")
         ref_cache = _phase1_build_or_load_ref_cache(
             ecfg=ecfg,
-            target_ref_dir=direction.tgt_ref_dir,
+            direction=direction,
             clip_runtime=clip_runtime,
             force_regen_cache=args.force_regen_cache,
         )

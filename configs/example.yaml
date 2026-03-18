@@ -103,9 +103,9 @@ cyclegan_eval:
   domain_B_name: "photo"
 
   # 根目录定义（自动拼接 /{domain_A_name} 与 /{domain_B_name}）
-  base_latent_dir: "../../projects/datasets/pt_datasets/unscaled_dataset"
-  base_orig_rgb_dir: "../../projects/datasets/monet2photo_rgb/test"
-  base_vae_recon_dir: "../../projects/datasets/monet2photo_rgb/test_recon"
+  base_latent_dir: "../../projects/datasets/pt_datasets/unscaled_test_dataset"
+  base_orig_rgb_dir: "../../projects/datasets/test_image_datasets"
+  base_vae_recon_dir: "../../projects/datasets/reconstructed_images"
 
   # 全局生成与评估控制（对每个方向生效）
   # 0 或 -1 表示不限制
@@ -150,5 +150,3 @@ cyclegan_eval:
   clip_local_only: false
   # clip_use_safetensors: 是否优先使用 safetensors 权重。
   clip_use_safetensors: false
-  # clip_target_text_prompt: 可选文本原型提示词；为空时仅使用图像原型进行风格相似度评估。
-  clip_target_text_prompt: ""
