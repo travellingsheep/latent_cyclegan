@@ -182,3 +182,43 @@ cyclegan_eval:
   clip_local_only: false
   # clip_use_safetensors: 是否优先使用 safetensors 权重。
   clip_use_safetensors: false
+
+# Evaluation config for evaluate_pixel.py (Standard Pixel-space CycleGAN evaluator)
+pixel_cyclegan_eval:
+  domain_A_name: "monet"
+  domain_B_name: "photo"
+
+  # 运行模式控制
+  # direction_mode: 可选 "single" 或 "both"
+  # single_direction: 当模式为 "single" 时生效，指定具体的 x2y 方向 (例如 "A2B" 或 "B2A")
+  direction_mode: "single"
+  single_direction: "A2B"
+
+  # 数据目录 (完全摒弃 latent 和 vae_recon)
+  base_test_image_dir: "../projects/datasets/test_image_datasets"
+  base_ref_image_dir: "../projects/datasets/test_image_datasets"
+
+  # 评测输出与模型路径
+  eval_output_dir: "../latent_cyclegan_outputs/eval_pixel_cyclegan"
+  reference_cache_dir: "../latent_cyclegan_outputs/eval_cache_pixel_cyclegan"
+  generator_checkpoint_path: "../projects/cyclegan_origin_repull/pytorch-CycleGAN-and-pix2pix/checkpoints/monet2photo_pretrained/latest_net_G.pth"
+
+  # 采样与硬件配置
+  max_eval_samples: 30
+  eval_seed: 42
+  eval_image_size: 256
+  eval_batch_size: 8
+  run_device: "cuda"
+  use_bf16_autocast: true
+
+  # 指标评估参数
+  ref_cache_max_images: 0
+  kid_ref_max_images: 100
+  kid_num_subsets: 100
+  kid_subset_size: 100
+  skip_lpips: false
+  skip_clip: false
+  clip_backbone_id: "openai/clip-vit-base-patch32"
+  clip_model_cache_dir: ""
+  clip_local_only: false
+  clip_use_safetensors: false

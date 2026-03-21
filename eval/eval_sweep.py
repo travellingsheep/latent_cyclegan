@@ -29,7 +29,7 @@ class RunResult:
     return_code: Optional[int] = None
     summary: Optional[Dict[str, Any]] = None
 
-
+SCRIPT_DIR = Path(__file__).resolve().parent
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sweep evaluator for latent CycleGAN runs")
     parser.add_argument(
@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--evaluate_script",
         type=str,
-        default=str(Path("utils") / "eval" / "evaluate_latent.py"),
+        default=str(SCRIPT_DIR / "evaluate_latent.py"),
         help="Path to evaluate_latent.py",
     )
     parser.add_argument(
