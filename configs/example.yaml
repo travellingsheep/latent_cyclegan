@@ -19,14 +19,14 @@ data:
   latent_divisor: 1
 
   # Few-shot ablation: set to a positive number to randomly truncate each domain.
-  # -1 means use all samples.
+  # -1 means use 100 samples.
   max_samples_a: -1
   max_samples_b: -1
 
 model:
   in_channels: 4
   out_channels: 4
-  # Smaller than image CycleGAN
+  # Sm100er than image CycleGAN
   ngf: 256
   ndf: 64
   n_res_blocks: 9
@@ -96,6 +96,38 @@ visualization:
   vae_subfolder: "vae"
   vae_scaling_factor: 0.18215
 
+# Batch export config for export_translated_images.py
+image_export:
+  # 域定义：默认继承自 cyclegan_eval.domain_A_name / domain_B_name
+  domain_A_name: "monet"
+  domain_B_name: "photo"
+
+  # latent 根目录：默认继承自 cyclegan_eval.base_latent_dir
+  base_latent_dir: "../projects/datasets/pt_datasets/unscaled_test_dataset"
+
+  # 三联图所需原图与 VAE 重建图目录：默认继承自 cyclegan_eval 对应字段
+  base_orig_rgb_dir: "../projects/datasets/test_image_datasets"
+  base_vae_recon_dir: "../projects/datasets/reconstructed_images"
+
+  # 模型 checkpoint 路径：支持完整训练 checkpoint，或只包含网络权重的 extracted_model.pt
+  model_path: "../latent_cyclegan_outputs/run_10/model/extracted_model.pt"
+
+  # 导出图片根目录：输出结构为 {output_dir}/A2B/*.png 和 {output_dir}/B2A/*.png
+  # 每张图都是 [原图 | 重建图 | 风格迁移图] 三联图
+  output_dir: "../latent_cyclegan_outputs/run_10/exported_images"
+
+  # 三联图中每个 panel 的显示边长；默认可与 cyclegan_eval.eval_image_size 保持一致
+  eval_image_size: 256
+
+  # 推理批大小；显存不足时可调小
+  batch_size: 8
+
+  # 运行设备，常用 "cuda" 或 "cpu"；请求 cuda 但不可用时会自动回退 cpu
+  run_device: "cuda"
+
+  # 是否在 CUDA 上启用 bf16 autocast 推理
+  use_bf16_autocast: true
+
 # Evaluation config for evaluate_latent.py (latent-space CycleGAN evaluator)
 cyclegan_eval:
   # 域定义：脚本会自动构造 A2B / B2A 两个方向
@@ -135,7 +167,7 @@ cyclegan_eval:
   # kid_num_subsets: KID 子集采样次数；越大越稳定但越慢。
   kid_num_subsets: 100
   # kid_subset_size: 每个 KID 子集大小；最终会受两域样本数上限约束。
-  kid_subset_size: 1000
+  kid_subset_size: 100
 
   # skip_lpips: 是否跳过 LPIPS 指标；在未安装 lpips 或希望加速时可设为 true。
   skip_lpips: false
