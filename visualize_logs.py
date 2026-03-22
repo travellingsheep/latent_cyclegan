@@ -76,7 +76,7 @@ def resolve_log_path(config_path: str, config: Dict[str, Any]) -> str:
 
 
 def discover_sweep_log_paths(config_path: str, config: Dict[str, Any]) -> List[str]:
-    """扫描 exp_root 下的 run_*/logs 目录，发现可用的 sweep 日志文件。"""
+    """扫描 exp_root 下一层子目录中的 logs 目录，发现可用的日志文件。"""
     exp_root = config.get("exp_root")
     logging_cfg = config.get("logging", {})
     if not isinstance(exp_root, str) or not exp_root.strip():
@@ -94,9 +94,10 @@ def discover_sweep_log_paths(config_path: str, config: Dict[str, Any]) -> List[s
 
     discovered_paths: List[str] = []
     for child_name in sorted(os.listdir(exp_root_path)):
-        if not child_name.startswith("run_"):
+        child_path = os.path.join(exp_root_path, child_name)
+        if not os.path.isdir(child_path):
             continue
-        candidate = os.path.join(exp_root_path, child_name, "logs", log_file)
+        candidate = os.path.join(child_path, "logs", log_file)
         if os.path.exists(candidate):
             discovered_paths.append(candidate)
 
@@ -124,7 +125,7 @@ def render_log_selector(primary_log_path: str, discovered_log_paths: List[str]) 
             "日志文件",
             options=options,
             index=options.index(st.session_state["selected_log_path"]),
-            help="优先读取基础训练日志；若不存在，可切换到 sweep 输出目录下的 run_*/logs/train_log.jsonl。",
+            help="优先读取基础训练日志；若不存在，可切换到 exp_root 下一层实验目录中的 logs/train_log.jsonl。",
         )
         st.session_state["selected_log_path"] = selected
         return selected
@@ -322,12 +323,12 @@ def main() -> None:
     st.write(f"目标日志文件: {log_path}")
     if not os.path.exists(log_path):
         if discovered_log_paths:
-            st.warning("基础日志文件不存在，但已经发现 sweep 运行目录。请在侧边栏切换到已有的 run_*/logs/train_log.jsonl。")
+            st.warning("基础日志文件不存在，但已经发现实验目录。请在侧边栏切换到已有的 logs/train_log.jsonl。")
         else:
             st.warning(
                 "日志文件暂时不存在。"
                 "如果你刚启动训练，这通常表示还没到第一次写日志的步数；"
-                "如果你在跑 sweep，请先确认对应 run_*/logs 目录下是否已经生成 train_log.jsonl。"
+                "如果你在跑 sweep，请先确认 exp_root 下一层实验目录中的 logs 目录下是否已经生成 train_log.jsonl。"
             )
         return
 
