@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
         "--exp_root",
         type=str,
         default="",
-        help="Experiment root directory containing run_* subfolders; overrides YAML exp_root",
+        help="Experiment root directory containing one-level experiment subfolders; overrides YAML exp_root",
     )
     parser.add_argument(
         "--evaluate_script",
@@ -113,9 +113,9 @@ def _set_nested_path_if_present(cfg: Dict[str, Any], keys: Tuple[str, ...], conf
         cur[leaf] = _resolve_path_value(config_dir, value)
 
 
-def write_resolved_eval_config(base_config_path: Path, exp_root: Path) -> Path:
-    cfg = load_yaml(base_config_path)
-    config_dir = base_config_path.parent.resolve()
+def write_resolved_eval_config(source_config_path: Path, exp_root: Path, output_path: Path) -> Path:
+    cfg = load_yaml(source_config_path)
+    config_dir = source_config_path.parent.resolve()
 
     path_fields: List[Tuple[str, ...]] = [
         ("exp_root",),
@@ -139,10 +139,9 @@ def write_resolved_eval_config(base_config_path: Path, exp_root: Path) -> Path:
 
     cfg["exp_root"] = str(exp_root)
 
-    resolved_path = exp_root / "eval_sweep_resolved_config.yaml"
-    with resolved_path.open("w", encoding="utf-8") as f:
+    with output_path.open("w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
-    return resolved_path
+    return output_path
 
 
 def resolve_reference_cache_dir(config_path: Path, cfg: Dict[str, Any], exp_root: Path) -> Path:
@@ -333,7 +332,7 @@ def write_global_summary(exp_root: Path, results: List[RunResult]) -> None:
 
 
 def collect_run_dirs(exp_root: Path) -> List[Path]:
-    dirs = [p for p in exp_root.iterdir() if p.is_dir() and p.name.startswith("run_")]
+    dirs = [p for p in exp_root.iterdir() if p.is_dir() and (p / "model" / "last.pt").exists()]
     return sorted(dirs, key=lambda p: p.name)
 
 
@@ -352,8 +351,6 @@ def main() -> None:
     if not exp_root.exists():
         raise FileNotFoundError(f"exp_root not found: {exp_root}")
 
-    resolved_config_path = write_resolved_eval_config(config_path, exp_root)
-
     evaluate_script = Path(args.evaluate_script).expanduser()
     if not evaluate_script.is_absolute():
         evaluate_script = (repo_root / evaluate_script).resolve()
@@ -361,19 +358,28 @@ def main() -> None:
     shared_cache_dir = resolve_reference_cache_dir(config_path, cfg, exp_root)
     run_dirs = collect_run_dirs(exp_root)
     if not run_dirs:
-        raise RuntimeError(f"No run_* directories found under: {exp_root}")
+        raise RuntimeError(f"No experiment directories with model/last.pt found under: {exp_root}")
 
     log(f"Using config: {config_path}")
-    log(f"Resolved eval config: {resolved_config_path}")
     log(f"Experiment root: {exp_root}")
     log(f"Evaluate script: {evaluate_script}")
     log(f"Shared cache dir: {shared_cache_dir}")
-    log(f"Found {len(run_dirs)} run directories")
+    log(f"Found {len(run_dirs)} experiment directories")
 
     results: List[RunResult] = []
     for run_dir in run_dirs:
         run_name = run_dir.name
         log(f"[RUN] Processing {run_name}")
+
+        run_config_path = run_dir / "config.yaml"
+        source_config_path = run_config_path if run_config_path.exists() else config_path
+        resolved_config_path = write_resolved_eval_config(
+            source_config_path=source_config_path,
+            exp_root=exp_root,
+            output_path=run_dir / "eval_resolved_config.yaml",
+        )
+        log(f"[RUN] Using config source: {source_config_path}")
+        log(f"[RUN] Resolved eval config: {resolved_config_path}")
 
         valid_existing, existing_summary, msg = is_valid_existing_run(run_dir)
         if valid_existing:

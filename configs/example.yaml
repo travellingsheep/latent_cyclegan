@@ -132,14 +132,19 @@ image_export:
 
 # Evaluation config for evaluate_latent.py (latent-space CycleGAN evaluator)
 cyclegan_eval:
+  # 可选：直接指定某个实验目录。
+  # 如果填写，evaluate_latent.py 会自动加载该目录下的 config.yaml，
+  # 并默认使用 {experiment_dir}/model/last.pt 与 {experiment_dir}/eval。
+  experiment_dir: "../latent_cyclegan_outputs/only_residual"
+
   # 域定义：脚本会自动构造 A2B / B2A 两个方向
   domain_A_name: "monet"
   domain_B_name: "photo"
 
   # 根目录定义（自动拼接 /{domain_A_name} 与 /{domain_B_name}）
-  base_latent_dir: "../../projects/datasets/pt_datasets/unscaled_test_dataset"
-  base_orig_rgb_dir: "../../projects/datasets/test_image_datasets"
-  base_vae_recon_dir: "../../projects/datasets/reconstructed_images"
+  base_latent_dir: "../projects/datasets/pt_datasets/unscaled_test_dataset"
+  base_orig_rgb_dir: "../projects/datasets/test_image_datasets"
+  base_vae_recon_dir: "../projects/datasets/reconstructed_images"
 
   # 全局生成与评估控制（对每个方向生效）
   # 0 或 -1 表示不限制
@@ -147,11 +152,11 @@ cyclegan_eval:
   eval_seed: 42
 
   # eval_output_dir: 评估输出目录；会写入生成图、3-panel、metrics_report.json、metrics.csv。
-  eval_output_dir: "../../latent_cyclegan_outputs/eval_cyclegan"
+  # eval_output_dir: "../latent_cyclegan_outputs/only_residual/eval"
   # reference_cache_dir: 参考统计缓存目录；用于复用 testB 的 FID/KID/CLIP 特征。
-  reference_cache_dir: "../../latent_cyclegan_outputs/eval_cache_cyclegan"
+  reference_cache_dir: "../latent_cyclegan_outputs/eval_cache_cyclegan"
   # generator_checkpoint_path: 生成器检查点路径；为空时回退到 train.checkpoint_dir/last.pt。
-  generator_checkpoint_path: "../../latent_cyclegan_outputs/model/last.pt"
+  # generator_checkpoint_path: "../latent_cyclegan_outputs/only_residual/model/last.pt"
 
   # eval_image_size: 评估时统一 resize 的边长（像素），同时影响缓存键与指标一致性。
   eval_image_size: 256

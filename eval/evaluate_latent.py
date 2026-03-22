@@ -18,8 +18,8 @@ from PIL import Image, ImageDraw
 from torchvision import transforms
 from tqdm import tqdm
 
-# Ensure repository root is importable when launching from utils/eval.
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# Ensure repository root is importable when launching from eval/.
+REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -322,6 +322,25 @@ def _phase0_parse_config(args: argparse.Namespace) -> EvalConfig:
     config_path = _resolve_repo_path(args.config)
     cfg = load_yaml_config(str(config_path))
 
+    initial_eval_cfg = cfg.get("cyclegan_eval", {})
+    _require(isinstance(initial_eval_cfg, dict), "config.cyclegan_eval must be a dict")
+
+    experiment_dir_raw = str(initial_eval_cfg.get("experiment_dir", "") or "").strip()
+    experiment_dir = Path("")
+    if experiment_dir_raw:
+        experiment_dir_candidate = _resolve_repo_path(experiment_dir_raw)
+        experiment_dir = experiment_dir_candidate
+        experiment_config_path = experiment_dir / "config.yaml"
+        _require(experiment_dir.exists(), f"cyclegan_eval.experiment_dir not found: {experiment_dir}")
+        _require(experiment_config_path.exists(), f"experiment config not found: {experiment_config_path}")
+        cfg = load_yaml_config(str(experiment_config_path))
+        merged_eval_cfg = cfg.get("cyclegan_eval", {})
+        _require(isinstance(merged_eval_cfg, dict), "experiment config.cyclegan_eval must be a dict")
+        merged_eval_cfg = dict(merged_eval_cfg)
+        merged_eval_cfg.update(initial_eval_cfg)
+        merged_eval_cfg["experiment_dir"] = str(experiment_dir)
+        cfg["cyclegan_eval"] = merged_eval_cfg
+
     model_cfg = cfg.get("model", {})
     vis_cfg = cfg.get("visualization", {})
     eval_cfg = cfg.get("cyclegan_eval", {})
@@ -339,13 +358,31 @@ def _phase0_parse_config(args: argparse.Namespace) -> EvalConfig:
     base_orig_rgb_dir = _resolve_repo_path(args.base_orig_rgb_dir or eval_cfg.get("base_orig_rgb_dir", "") or "")
     base_vae_recon_dir = _resolve_repo_path(args.base_vae_recon_dir or eval_cfg.get("base_vae_recon_dir", "") or "")
 
-    eval_output_dir = _resolve_repo_path(args.eval_output_dir or eval_cfg.get("eval_output_dir", "outputs/eval_latent"))
+    if experiment_dir:
+        default_checkpoint_dir = experiment_dir / "model"
+        default_generator_checkpoint_path = default_checkpoint_dir / "last.pt"
+        default_eval_output_dir = experiment_dir / "eval"
+        eval_output_dir = _resolve_repo_path(args.eval_output_dir or default_eval_output_dir)
+        checkpoint_dir = _resolve_repo_path(args.checkpoint_dir or default_checkpoint_dir)
+        generator_checkpoint_path = _resolve_repo_path(
+            args.generator_checkpoint_path or default_generator_checkpoint_path
+        )
+    else:
+        default_checkpoint_dir = _resolve_repo_path(cfg.get("train", {}).get("checkpoint_dir", "outputs/model"))
+        default_generator_checkpoint_path = default_checkpoint_dir / "last.pt"
+        default_eval_output_dir = _resolve_repo_path(eval_cfg.get("eval_output_dir", "outputs/eval_latent"))
+        eval_output_dir = _resolve_repo_path(
+            args.eval_output_dir or eval_cfg.get("eval_output_dir", "") or default_eval_output_dir
+        )
+        checkpoint_dir = _resolve_repo_path(
+            args.checkpoint_dir or cfg.get("train", {}).get("checkpoint_dir", "") or default_checkpoint_dir
+        )
+        generator_checkpoint_path = _resolve_repo_path(
+            args.generator_checkpoint_path or eval_cfg.get("generator_checkpoint_path", "") or default_generator_checkpoint_path
+        )
+
     reference_cache_dir = _resolve_repo_path(
         args.reference_cache_dir or eval_cfg.get("reference_cache_dir", "outputs/eval_cache_latent")
-    )
-    checkpoint_dir = _resolve_repo_path(args.checkpoint_dir or cfg.get("train", {}).get("checkpoint_dir", "outputs/model"))
-    generator_checkpoint_path = _resolve_repo_path(
-        args.generator_checkpoint_path or eval_cfg.get("generator_checkpoint_path", "") or checkpoint_dir / "last.pt"
     )
 
     eval_image_size = int(args.eval_image_size or eval_cfg.get("eval_image_size", 256))
@@ -413,7 +450,7 @@ def _phase1_build_or_load_ref_cache(
 ) -> Dict[str, Any]:
     from cleanfid import fid
 
-    cleanfid_model = fid.build_feature_extractor(mode="clean", device=ecfg.run_device, use_dataparallel=False)
+    cleanfid_model = None
 
     if clip_runtime is None:
         clip_model_id, clip_model, clip_processor = _load_clip_model(ecfg.eval_cfg, ecfg.run_device)
@@ -423,6 +460,8 @@ def _phase1_build_or_load_ref_cache(
         clip_processor = clip_runtime["clip_processor"]
 
     def _build_or_load_domain_cache(reference_rgb_dir: Path, cache_tag: str) -> Dict[str, Any]:
+        nonlocal cleanfid_model
+
         cache_name = f"{cache_tag}_" + _get_cache_name(reference_rgb_dir, ecfg.eval_image_size, clip_model_id)
         cache_path = ecfg.reference_cache_dir / cache_name
 
@@ -444,6 +483,13 @@ def _phase1_build_or_load_ref_cache(
             if len(ref_paths) > ref_cache_max_images:
                 random.seed(42)
                 ref_paths = random.sample(ref_paths, ref_cache_max_images)
+
+        if cleanfid_model is None:
+            cleanfid_model = fid.build_feature_extractor(
+                mode="clean",
+                device=ecfg.run_device,
+                use_dataparallel=False,
+            )
 
         cleanfid_features = fid.get_folder_features(
             fdir=str(reference_rgb_dir),
@@ -532,6 +578,8 @@ def _load_generators(ecfg: EvalConfig) -> Dict[str, torch.nn.Module]:
             ngf=int(ecfg.model_cfg.get("ngf", 256)),
             n_res_blocks=int(ecfg.model_cfg.get("n_res_blocks", 9)),
             out_activation=str(ecfg.model_cfg.get("out_activation", "none")),
+            use_global_residual=bool(ecfg.model_cfg.get("use_global_residual", False)),
+            use_pointwise_only=bool(ecfg.model_cfg.get("use_pointwise_only", False)),
         )
 
     def _pick_state_dict(keys: Sequence[str]) -> Optional[Dict[str, torch.Tensor]]:
