@@ -10,8 +10,24 @@ from typing import Any, Dict, List, TextIO
 import yaml
 
 
-# 固定的扫描列表，用于 Photo 域 few-shot 消融实验。
-SWEEP_VALUES = [-1, 3000, 1000, 500, 100, 10]
+# 固定的扫描列表，用于残差 / pointwise 消融实验。
+SWEEP_EXPERIMENTS = [
+    {
+        "name": "only_residual",
+        "use_global_residual": True,
+        "use_pointwise_only": False,
+    },
+    {
+        "name": "only_pointwise",
+        "use_global_residual": False,
+        "use_pointwise_only": True,
+    },
+    {
+        "name": "residual+pointwise",
+        "use_global_residual": True,
+        "use_pointwise_only": True,
+    },
+]
 
 
 def now_str() -> str:
@@ -103,12 +119,19 @@ def ensure_mapping(parent: Dict[str, Any], key: str) -> Dict[str, Any]:
     return value
 
 
-def make_experiment_config(base_config: Dict[str, Any], base_config_path: str, exp_root: str, val: int) -> Dict[str, Any]:
+def make_experiment_config(
+    base_config: Dict[str, Any],
+    base_config_path: str,
+    exp_root: str,
+    exp_name: str,
+    use_global_residual: bool,
+    use_pointwise_only: bool,
+) -> Dict[str, Any]:
     """基于基础配置生成单次实验的配置快照。"""
-    exp_name = "all" if val == -1 else str(val)
-    exp_dir = os.path.join(exp_root, f"run_{exp_name}")
+    exp_dir = os.path.join(exp_root, exp_name)
 
     data_cfg = ensure_mapping(base_config, "data")
+    model_cfg = ensure_mapping(base_config, "model")
     train_cfg = ensure_mapping(base_config, "train")
     logging_cfg = ensure_mapping(base_config, "logging")
     vis_cfg = ensure_mapping(base_config, "visualization")
@@ -118,7 +141,8 @@ def make_experiment_config(base_config: Dict[str, Any], base_config_path: str, e
         data_cfg["a_dir"] = resolve_config_path_value(base_config_path, data_cfg["a_dir"])
     if isinstance(data_cfg.get("b_dir"), str) and data_cfg["b_dir"]:
         data_cfg["b_dir"] = resolve_config_path_value(base_config_path, data_cfg["b_dir"])
-    data_cfg["max_samples_b"] = val
+    model_cfg["use_global_residual"] = use_global_residual
+    model_cfg["use_pointwise_only"] = use_pointwise_only
     train_cfg["checkpoint_dir"] = os.path.join(exp_dir, "model")
     logging_cfg["log_dir"] = os.path.join(exp_dir, "logs")
     vis_cfg["out_dir"] = os.path.join(exp_dir, "vis")
@@ -182,7 +206,9 @@ def run_experiment(repo_root: str, exp_dir: str, config_path: str, log_file: str
 def write_summary_csv(summary_path: str, results: List[Dict[str, Any]]) -> None:
     """将当前 sweep 汇总结果写入 CSV，便于后续统计与追踪。"""
     fieldnames = [
-        "max_samples_b",
+        "experiment_name",
+        "use_global_residual",
+        "use_pointwise_only",
         "status",
         "return_code",
         "duration_sec",
@@ -203,12 +229,12 @@ def print_summary_table(results: List[Dict[str, Any]]) -> None:
     if not results:
         return
 
-    headers = ["max_samples_b", "status", "return_code", "duration_sec", "exp_dir"]
+    headers = ["experiment_name", "status", "return_code", "duration_sec", "exp_dir"]
     rows: List[List[str]] = []
     for result in results:
         rows.append(
             [
-                str(result.get("max_samples_b", "")),
+                str(result.get("experiment_name", "")),
                 str(result.get("status", "")),
                 str(result.get("return_code", "")),
                 f"{float(result.get('duration_sec', 0.0)):.2f}",
@@ -235,7 +261,7 @@ def print_summary_table(results: List[Dict[str, Any]]) -> None:
 
 
 def main() -> None:
-    """按预定义 sweep 列表循环执行消融实验。"""
+    """按预定义布尔组合循环执行消融实验。"""
     args = parse_args()
     repo_root = get_repo_root()
     base_config_path = os.path.abspath(args.config if args.config else get_base_config_path(repo_root))
@@ -255,14 +281,19 @@ def main() -> None:
     sweep_log(f"Experiment root: {exp_root}")
     sweep_log(f"Dry-run mode: {args.dry_run}")
 
-    for val in SWEEP_VALUES:
-        exp_name = "all" if val == -1 else str(val)
-        exp_dir = os.path.join(exp_root, f"run_{exp_name}")
+    for experiment in SWEEP_EXPERIMENTS:
+        exp_name = str(experiment["name"])
+        use_global_residual = bool(experiment["use_global_residual"])
+        use_pointwise_only = bool(experiment["use_pointwise_only"])
+        exp_dir = os.path.join(exp_root, exp_name)
         os.makedirs(exp_dir, exist_ok=True)
 
         print()
         sweep_log("=" * 100)
-        sweep_log(f"Starting sweep run for max_samples_b={val}")
+        sweep_log(
+            "Starting sweep run for "
+            f"{exp_name} (use_global_residual={use_global_residual}, use_pointwise_only={use_pointwise_only})"
+        )
         sweep_log(f"Experiment directory: {os.path.abspath(exp_dir)}")
         sweep_log("=" * 100)
 
@@ -276,7 +307,9 @@ def main() -> None:
                 config,
                 base_config_path=base_config_path,
                 exp_root=exp_root,
-                val=val,
+                exp_name=exp_name,
+                use_global_residual=use_global_residual,
+                use_pointwise_only=use_pointwise_only,
             )
             dump_yaml_config(snapshot_path, run_config)
 
@@ -296,17 +329,19 @@ def main() -> None:
                     status = "FAILED"
                     message = f"Sweep run failed with return code {return_code}."
                     sweep_log(
-                        f"\033[91m[ERROR] Sweep run failed for max_samples_b={val}, return code={return_code}\033[0m",
+                        f"\033[91m[ERROR] Sweep run failed for {exp_name}, return code={return_code}\033[0m",
                     )
                 else:
                     status = "OK"
                     message = "Sweep run finished successfully."
-                    sweep_log(f"[OK] Sweep run finished for max_samples_b={val}")
+                    sweep_log(f"[OK] Sweep run finished for {exp_name}")
 
             duration_sec = time.time() - start_time
             results.append(
                 {
-                    "max_samples_b": val,
+                    "experiment_name": exp_name,
+                    "use_global_residual": use_global_residual,
+                    "use_pointwise_only": use_pointwise_only,
                     "status": status,
                     "return_code": return_code,
                     "duration_sec": round(duration_sec, 2),
@@ -319,11 +354,13 @@ def main() -> None:
             write_summary_csv(summary_path, results)
             print_summary_table(results)
         except Exception as exc:
-            sweep_log(f"\033[91m[ERROR] Sweep run crashed for max_samples_b={val}: {exc}\033[0m")
+            sweep_log(f"\033[91m[ERROR] Sweep run crashed for {exp_name}: {exc}\033[0m")
             duration_sec = time.time() - start_time
             results.append(
                 {
-                    "max_samples_b": val,
+                    "experiment_name": exp_name,
+                    "use_global_residual": use_global_residual,
+                    "use_pointwise_only": use_pointwise_only,
                     "status": "CRASHED",
                     "return_code": -1,
                     "duration_sec": round(duration_sec, 2),

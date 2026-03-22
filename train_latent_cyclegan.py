@@ -65,6 +65,13 @@ def init_weights_normal(m: nn.Module, mean: float = 0.0, std: float = 0.02) -> N
             nn.init.constant_(m.bias.data, 0.0)
 
 
+def zero_init_module(m: nn.Module) -> None:
+    if hasattr(m, "weight") and getattr(m, "weight", None) is not None:
+        nn.init.constant_(m.weight.data, 0.0)
+    if hasattr(m, "bias") and getattr(m, "bias", None) is not None:
+        nn.init.constant_(m.bias.data, 0.0)
+
+
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
@@ -347,21 +354,32 @@ def get_infinite_iterator(dataloader: DataLoader) -> Iterator[torch.Tensor]:
 
 
 class ResnetBlock(nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, use_pointwise_only: bool = False):
         super().__init__()
-        self.block = nn.Sequential(
-            nn.ReflectionPad2d(1),
-            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, groups=dim, bias=False),
-            # nn.ReflectionPad2d(1),
-            nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False),
-            nn.InstanceNorm2d(dim, affine=False, track_running_stats=False),
-            nn.ReLU(inplace=True),
-            # nn.ReflectionPad2d(1),
-            nn.ReflectionPad2d(1),
-            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, groups=dim, bias=False),
-            nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False),
-            nn.InstanceNorm2d(dim, affine=False, track_running_stats=False),
-        )
+        layers: List[nn.Module] = []
+        if use_pointwise_only:
+            layers += [
+                # nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, groups=dim, bias=False),
+                nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False),
+                nn.InstanceNorm2d(dim, affine=False, track_running_stats=False),
+                nn.ReLU(inplace=True),
+                # nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, groups=dim, bias=False),
+                nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False),
+                nn.InstanceNorm2d(dim, affine=False, track_running_stats=False),
+            ]
+        else:
+            layers += [
+                nn.ReflectionPad2d(1),
+                nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, groups=dim, bias=False),
+                nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False),
+                nn.InstanceNorm2d(dim, affine=False, track_running_stats=False),
+                nn.ReLU(inplace=True),
+                nn.ReflectionPad2d(1),
+                nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, groups=dim, bias=False),
+                nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False),
+                nn.InstanceNorm2d(dim, affine=False, track_running_stats=False),
+            ]
+        self.block = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.block(x)
@@ -375,27 +393,42 @@ class ResnetGenerator(nn.Module):
         ngf: int = 32,
         n_res_blocks: int = 6,
         out_activation: str = "none",
+        use_global_residual: bool = False,
+        use_pointwise_only: bool = False,
     ):
         super().__init__()
+        self.use_global_residual = use_global_residual
         layers: List[nn.Module] = []
 
         # c7s1
-        layers += [
-            nn.ReflectionPad2d(2),
-            nn.Conv2d(in_ch, ngf, kernel_size=5, stride=1, padding=0, bias=False),
-            nn.InstanceNorm2d(ngf, affine=False, track_running_stats=False),
-            nn.ReLU(inplace=True),
-        ]
+        if use_pointwise_only:
+            layers += [
+                nn.Conv2d(in_ch, ngf, kernel_size=1, stride=1, padding=0, bias=False),
+                nn.InstanceNorm2d(ngf, affine=False, track_running_stats=False),
+                nn.ReLU(inplace=True),
+            ]
+        else:
+            layers += [
+                nn.ReflectionPad2d(2),
+                nn.Conv2d(in_ch, ngf, kernel_size=5, stride=1, padding=0, bias=False),
+                nn.InstanceNorm2d(ngf, affine=False, track_running_stats=False),
+                nn.ReLU(inplace=True),
+            ]
 
         # res blocks
         for _ in range(n_res_blocks):
-            layers += [ResnetBlock(ngf)]
+            layers += [ResnetBlock(ngf, use_pointwise_only=use_pointwise_only)]
 
         # output
-        layers += [
-            nn.ReflectionPad2d(2),
-            nn.Conv2d(ngf, out_ch, kernel_size=5, stride=1, padding=0, bias=True),
-        ]
+        if use_pointwise_only:
+            layers += [
+                nn.Conv2d(ngf, out_ch, kernel_size=1, stride=1, padding=0, bias=True),
+            ]
+        else:
+            layers += [
+                nn.ReflectionPad2d(2),
+                nn.Conv2d(ngf, out_ch, kernel_size=5, stride=1, padding=0, bias=True),
+            ]
 
         if out_activation.lower() == "tanh":
             layers += [nn.Tanh()]
@@ -405,9 +438,15 @@ class ResnetGenerator(nn.Module):
             raise ValueError(f"Unsupported out_activation: {out_activation}")
 
         self.net = nn.Sequential(*layers)
+        self.output_conv = next(
+            module for module in reversed(self.net) if isinstance(module, nn.Conv2d)
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        out = self.net(x)
+        if self.use_global_residual:
+            return x + out
+        return out
 
 
 class PatchDiscriminator(nn.Module):
@@ -678,9 +717,27 @@ def train(cfg: Dict[str, Any]) -> None:
     n_res_blocks = int(model_cfg.get("n_res_blocks", 6))
     d_layers = int(model_cfg.get("d_layers", 3))
     out_activation = str(model_cfg.get("out_activation", "none"))
+    use_global_residual = bool(model_cfg.get("use_global_residual", False))
+    use_pointwise_only = bool(model_cfg.get("use_pointwise_only", False))
 
-    G = ResnetGenerator(in_ch=in_ch, out_ch=out_ch, ngf=ngf, n_res_blocks=n_res_blocks, out_activation=out_activation).to(device)
-    F = ResnetGenerator(in_ch=in_ch, out_ch=out_ch, ngf=ngf, n_res_blocks=n_res_blocks, out_activation=out_activation).to(device)
+    G = ResnetGenerator(
+        in_ch=in_ch,
+        out_ch=out_ch,
+        ngf=ngf,
+        n_res_blocks=n_res_blocks,
+        out_activation=out_activation,
+        use_global_residual=use_global_residual,
+        use_pointwise_only=use_pointwise_only,
+    ).to(device)
+    F = ResnetGenerator(
+        in_ch=in_ch,
+        out_ch=out_ch,
+        ngf=ngf,
+        n_res_blocks=n_res_blocks,
+        out_activation=out_activation,
+        use_global_residual=use_global_residual,
+        use_pointwise_only=use_pointwise_only,
+    ).to(device)
     D_A = PatchDiscriminator(in_ch=in_ch, ndf=ndf, n_layers=d_layers).to(device)
     D_B = PatchDiscriminator(in_ch=in_ch, ndf=ndf, n_layers=d_layers).to(device)
 
@@ -736,6 +793,9 @@ def train(cfg: Dict[str, Any]) -> None:
         F.apply(init_weights_normal)
         D_A.apply(init_weights_normal)
         D_B.apply(init_weights_normal)
+        if use_global_residual:
+            zero_init_module(G.output_conv)
+            zero_init_module(F.output_conv)
 
     fake_a_buffer = ReplayBuffer(max_size=max(0, fake_buffer_size), p_use_history=fake_buffer_prob)
     fake_b_buffer = ReplayBuffer(max_size=max(0, fake_buffer_size), p_use_history=fake_buffer_prob)

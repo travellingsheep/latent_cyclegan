@@ -19,7 +19,7 @@ data:
   latent_divisor: 1
 
   # Few-shot ablation: set to a positive number to randomly truncate each domain.
-  # -1 means use 100 samples.
+  # -1 means use all samples.
   max_samples_a: -1
   max_samples_b: -1
 
@@ -33,6 +33,8 @@ model:
   d_layers: 3
   # For latents, default is unconstrained output
   out_activation: "none"  # one of: none, tanh
+  use_global_residual: false  # 是否在生成器输出端添加全局残差 x + net(x)
+  use_pointwise_only: false   # 是否将生成器中所有卷积替换为 1x1 卷积并移除 Padding
 
 train:
   device: "cuda"   # "cuda" or "cpu"
