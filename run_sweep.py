@@ -10,24 +10,8 @@ from typing import Any, Dict, List, TextIO
 import yaml
 
 
-# 固定的扫描列表，用于残差 / pointwise 消融实验。
-SWEEP_EXPERIMENTS = [
-    {
-        "name": "only_residual",
-        "use_global_residual": True,
-        "use_pointwise_only": False,
-    },
-    {
-        "name": "only_pointwise",
-        "use_global_residual": False,
-        "use_pointwise_only": True,
-    },
-    {
-        "name": "residual+pointwise",
-        "use_global_residual": True,
-        "use_pointwise_only": True,
-    },
-]
+# 固定的扫描列表，用于 batch size 消融实验。
+SWEEP_BATCH_SIZES = [1, 2, 4, 8, 16]
 
 
 def now_str() -> str:
@@ -47,7 +31,7 @@ def sweep_log(message: str, flush: bool = True) -> None:
 
 def parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
-    parser = argparse.ArgumentParser(description="CycleGAN few-shot 消融实验扫描脚本")
+    parser = argparse.ArgumentParser(description="CycleGAN batch size 消融实验扫描脚本")
     parser.add_argument(
         "--config",
         type=str,
@@ -102,6 +86,21 @@ def resolve_config_path_value(config_path: str, path_value: str) -> str:
     return os.path.abspath(os.path.join(config_dir, path_value))
 
 
+def resolve_model_name_or_path(config_path: str, value: str) -> str:
+    """仅在值看起来像本地路径时做展开；Hugging Face repo id 保持原样。"""
+    normalized = os.path.expanduser(value.strip())
+    if os.path.isabs(normalized):
+        return os.path.abspath(normalized)
+    if normalized.startswith("."):
+        config_dir = os.path.dirname(os.path.abspath(config_path)) or os.getcwd()
+        return os.path.abspath(os.path.join(config_dir, normalized))
+
+    candidate = resolve_config_path_value(config_path, normalized)
+    if os.path.exists(candidate):
+        return candidate
+    return value
+
+
 def dump_yaml_config(config_path: str, config: Dict[str, Any]) -> None:
     """将配置快照写入目标路径。"""
     with open(config_path, "w", encoding="utf-8") as file_obj:
@@ -124,14 +123,13 @@ def make_experiment_config(
     base_config_path: str,
     exp_root: str,
     exp_name: str,
-    use_global_residual: bool,
-    use_pointwise_only: bool,
+    batch_size: int,
 ) -> Dict[str, Any]:
     """基于基础配置生成单次实验的配置快照。"""
     exp_dir = os.path.join(exp_root, exp_name)
 
     data_cfg = ensure_mapping(base_config, "data")
-    model_cfg = ensure_mapping(base_config, "model")
+    shared_cfg = ensure_mapping(base_config, "shared")
     train_cfg = ensure_mapping(base_config, "train")
     logging_cfg = ensure_mapping(base_config, "logging")
     vis_cfg = ensure_mapping(base_config, "visualization")
@@ -141,8 +139,11 @@ def make_experiment_config(
         data_cfg["a_dir"] = resolve_config_path_value(base_config_path, data_cfg["a_dir"])
     if isinstance(data_cfg.get("b_dir"), str) and data_cfg["b_dir"]:
         data_cfg["b_dir"] = resolve_config_path_value(base_config_path, data_cfg["b_dir"])
-    model_cfg["use_global_residual"] = use_global_residual
-    model_cfg["use_pointwise_only"] = use_pointwise_only
+    if isinstance(shared_cfg.get("vae_model_name_or_path"), str) and shared_cfg["vae_model_name_or_path"]:
+        shared_cfg["vae_model_name_or_path"] = resolve_model_name_or_path(
+            base_config_path, shared_cfg["vae_model_name_or_path"]
+        )
+    train_cfg["batch_size"] = int(batch_size)
     train_cfg["checkpoint_dir"] = os.path.join(exp_dir, "model")
     logging_cfg["log_dir"] = os.path.join(exp_dir, "logs")
     vis_cfg["out_dir"] = os.path.join(exp_dir, "vis")
@@ -207,8 +208,7 @@ def write_summary_csv(summary_path: str, results: List[Dict[str, Any]]) -> None:
     """将当前 sweep 汇总结果写入 CSV，便于后续统计与追踪。"""
     fieldnames = [
         "experiment_name",
-        "use_global_residual",
-        "use_pointwise_only",
+        "batch_size",
         "status",
         "return_code",
         "duration_sec",
@@ -261,7 +261,7 @@ def print_summary_table(results: List[Dict[str, Any]]) -> None:
 
 
 def main() -> None:
-    """按预定义布尔组合循环执行消融实验。"""
+    """按预定义 batch size 列表循环执行消融实验。"""
     args = parse_args()
     repo_root = get_repo_root()
     base_config_path = os.path.abspath(args.config if args.config else get_base_config_path(repo_root))
@@ -281,19 +281,14 @@ def main() -> None:
     sweep_log(f"Experiment root: {exp_root}")
     sweep_log(f"Dry-run mode: {args.dry_run}")
 
-    for experiment in SWEEP_EXPERIMENTS:
-        exp_name = str(experiment["name"])
-        use_global_residual = bool(experiment["use_global_residual"])
-        use_pointwise_only = bool(experiment["use_pointwise_only"])
+    for batch_size in SWEEP_BATCH_SIZES:
+        exp_name = f"batch_size_{batch_size}"
         exp_dir = os.path.join(exp_root, exp_name)
         os.makedirs(exp_dir, exist_ok=True)
 
         print()
         sweep_log("=" * 100)
-        sweep_log(
-            "Starting sweep run for "
-            f"{exp_name} (use_global_residual={use_global_residual}, use_pointwise_only={use_pointwise_only})"
-        )
+        sweep_log(f"Starting sweep run for {exp_name} (batch_size={batch_size})")
         sweep_log(f"Experiment directory: {os.path.abspath(exp_dir)}")
         sweep_log("=" * 100)
 
@@ -308,8 +303,7 @@ def main() -> None:
                 base_config_path=base_config_path,
                 exp_root=exp_root,
                 exp_name=exp_name,
-                use_global_residual=use_global_residual,
-                use_pointwise_only=use_pointwise_only,
+                batch_size=batch_size,
             )
             dump_yaml_config(snapshot_path, run_config)
 
@@ -340,8 +334,7 @@ def main() -> None:
             results.append(
                 {
                     "experiment_name": exp_name,
-                    "use_global_residual": use_global_residual,
-                    "use_pointwise_only": use_pointwise_only,
+                    "batch_size": batch_size,
                     "status": status,
                     "return_code": return_code,
                     "duration_sec": round(duration_sec, 2),
@@ -359,8 +352,7 @@ def main() -> None:
             results.append(
                 {
                     "experiment_name": exp_name,
-                    "use_global_residual": use_global_residual,
-                    "use_pointwise_only": use_pointwise_only,
+                    "batch_size": batch_size,
                     "status": "CRASHED",
                     "return_code": -1,
                     "duration_sec": round(duration_sec, 2),

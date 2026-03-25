@@ -65,56 +65,8 @@ def init_weights_normal(m: nn.Module, mean: float = 0.0, std: float = 0.02) -> N
             nn.init.constant_(m.bias.data, 0.0)
 
 
-def zero_init_module(m: nn.Module) -> None:
-    if hasattr(m, "weight") and getattr(m, "weight", None) is not None:
-        nn.init.constant_(m.weight.data, 0.0)
-    if hasattr(m, "bias") and getattr(m, "bias", None) is not None:
-        nn.init.constant_(m.bias.data, 0.0)
-
-
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
-
-
-def _recover_user_path(text: str) -> str:
-    normalized = text.strip()
-    if "~" not in normalized:
-        return normalized
-
-    parts = Path(normalized).parts
-    if "~" not in parts:
-        return normalized
-
-    tilde_idx = parts.index("~")
-    return str(Path("~").joinpath(*parts[tilde_idx + 1 :]))
-
-
-def _normalize_model_name_or_path(model_name_or_path: str) -> str:
-    raw = _recover_user_path(model_name_or_path)
-    if raw.startswith("~"):
-        return str(Path(raw).expanduser())
-    return raw
-
-
-def resolve_vae_source(cfg: Dict[str, Any], vis_cfg: Dict[str, Any]) -> Tuple[str, Optional[str]]:
-    shared_cfg = cfg.get("shared", {})
-    if not isinstance(shared_cfg, dict):
-        shared_cfg = {}
-
-    shared_vae_name = shared_cfg.get("vae_model_name_or_path")
-    if isinstance(shared_vae_name, str) and shared_vae_name.strip():
-        vae_name = shared_vae_name.strip()
-    else:
-        vae_name = str(vis_cfg.get("vae_model_name_or_path", "") or "").strip()
-
-    if "vae_subfolder" in shared_cfg:
-        shared_subfolder = str(shared_cfg.get("vae_subfolder", "") or "").strip()
-        vae_subfolder = shared_subfolder if shared_subfolder else None
-    else:
-        vis_subfolder = str(vis_cfg.get("vae_subfolder", "") or "").strip()
-        vae_subfolder = vis_subfolder if vis_subfolder else None
-
-    return vae_name, vae_subfolder
 
 
 def _default_checkpoint_dir() -> str:
@@ -395,32 +347,21 @@ def get_infinite_iterator(dataloader: DataLoader) -> Iterator[torch.Tensor]:
 
 
 class ResnetBlock(nn.Module):
-    def __init__(self, dim: int, use_pointwise_only: bool = False):
+    def __init__(self, dim: int):
         super().__init__()
-        layers: List[nn.Module] = []
-        if use_pointwise_only:
-            layers += [
-                # nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, groups=dim, bias=False),
-                nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False),
-                nn.InstanceNorm2d(dim, affine=False, track_running_stats=False),
-                nn.ReLU(inplace=True),
-                # nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, groups=dim, bias=False),
-                nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False),
-                nn.InstanceNorm2d(dim, affine=False, track_running_stats=False),
-            ]
-        else:
-            layers += [
-                nn.ReflectionPad2d(1),
-                nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, groups=dim, bias=False),
-                nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False),
-                nn.InstanceNorm2d(dim, affine=False, track_running_stats=False),
-                nn.ReLU(inplace=True),
-                nn.ReflectionPad2d(1),
-                nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, groups=dim, bias=False),
-                nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False),
-                nn.InstanceNorm2d(dim, affine=False, track_running_stats=False),
-            ]
-        self.block = nn.Sequential(*layers)
+        self.block = nn.Sequential(
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, groups=dim, bias=False),
+            # nn.ReflectionPad2d(1),
+            nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.InstanceNorm2d(dim, affine=False, track_running_stats=False),
+            nn.ReLU(inplace=True),
+            # nn.ReflectionPad2d(1),
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, groups=dim, bias=False),
+            nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.InstanceNorm2d(dim, affine=False, track_running_stats=False),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.block(x)
@@ -434,42 +375,27 @@ class ResnetGenerator(nn.Module):
         ngf: int = 32,
         n_res_blocks: int = 6,
         out_activation: str = "none",
-        use_global_residual: bool = False,
-        use_pointwise_only: bool = False,
     ):
         super().__init__()
-        self.use_global_residual = use_global_residual
         layers: List[nn.Module] = []
 
         # c7s1
-        if use_pointwise_only:
-            layers += [
-                nn.Conv2d(in_ch, ngf, kernel_size=1, stride=1, padding=0, bias=False),
-                nn.InstanceNorm2d(ngf, affine=False, track_running_stats=False),
-                nn.ReLU(inplace=True),
-            ]
-        else:
-            layers += [
-                nn.ReflectionPad2d(2),
-                nn.Conv2d(in_ch, ngf, kernel_size=5, stride=1, padding=0, bias=False),
-                nn.InstanceNorm2d(ngf, affine=False, track_running_stats=False),
-                nn.ReLU(inplace=True),
-            ]
+        layers += [
+            nn.ReflectionPad2d(2),
+            nn.Conv2d(in_ch, ngf, kernel_size=5, stride=1, padding=0, bias=False),
+            nn.InstanceNorm2d(ngf, affine=False, track_running_stats=False),
+            nn.ReLU(inplace=True),
+        ]
 
         # res blocks
         for _ in range(n_res_blocks):
-            layers += [ResnetBlock(ngf, use_pointwise_only=use_pointwise_only)]
+            layers += [ResnetBlock(ngf)]
 
         # output
-        if use_pointwise_only:
-            layers += [
-                nn.Conv2d(ngf, out_ch, kernel_size=1, stride=1, padding=0, bias=True),
-            ]
-        else:
-            layers += [
-                nn.ReflectionPad2d(2),
-                nn.Conv2d(ngf, out_ch, kernel_size=5, stride=1, padding=0, bias=True),
-            ]
+        layers += [
+            nn.ReflectionPad2d(2),
+            nn.Conv2d(ngf, out_ch, kernel_size=5, stride=1, padding=0, bias=True),
+        ]
 
         if out_activation.lower() == "tanh":
             layers += [nn.Tanh()]
@@ -479,15 +405,9 @@ class ResnetGenerator(nn.Module):
             raise ValueError(f"Unsupported out_activation: {out_activation}")
 
         self.net = nn.Sequential(*layers)
-        self.output_conv = next(
-            module for module in reversed(self.net) if isinstance(module, nn.Conv2d)
-        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.net(x)
-        if self.use_global_residual:
-            return x + out
-        return out
+        return self.net(x)
 
 
 class PatchDiscriminator(nn.Module):
@@ -532,7 +452,6 @@ def _load_vae(model_name_or_path: str, subfolder: Optional[str], device: torch.d
             "Missing dependency 'diffusers'. Install it: pip install diffusers transformers accelerate safetensors"
         ) from e
 
-    model_name_or_path = _normalize_model_name_or_path(model_name_or_path)
     kwargs: Dict[str, Any] = {}
     if subfolder:
         kwargs["subfolder"] = subfolder
@@ -759,27 +678,9 @@ def train(cfg: Dict[str, Any]) -> None:
     n_res_blocks = int(model_cfg.get("n_res_blocks", 6))
     d_layers = int(model_cfg.get("d_layers", 3))
     out_activation = str(model_cfg.get("out_activation", "none"))
-    use_global_residual = bool(model_cfg.get("use_global_residual", False))
-    use_pointwise_only = bool(model_cfg.get("use_pointwise_only", False))
 
-    G = ResnetGenerator(
-        in_ch=in_ch,
-        out_ch=out_ch,
-        ngf=ngf,
-        n_res_blocks=n_res_blocks,
-        out_activation=out_activation,
-        use_global_residual=use_global_residual,
-        use_pointwise_only=use_pointwise_only,
-    ).to(device)
-    F = ResnetGenerator(
-        in_ch=in_ch,
-        out_ch=out_ch,
-        ngf=ngf,
-        n_res_blocks=n_res_blocks,
-        out_activation=out_activation,
-        use_global_residual=use_global_residual,
-        use_pointwise_only=use_pointwise_only,
-    ).to(device)
+    G = ResnetGenerator(in_ch=in_ch, out_ch=out_ch, ngf=ngf, n_res_blocks=n_res_blocks, out_activation=out_activation).to(device)
+    F = ResnetGenerator(in_ch=in_ch, out_ch=out_ch, ngf=ngf, n_res_blocks=n_res_blocks, out_activation=out_activation).to(device)
     D_A = PatchDiscriminator(in_ch=in_ch, ndf=ndf, n_layers=d_layers).to(device)
     D_B = PatchDiscriminator(in_ch=in_ch, ndf=ndf, n_layers=d_layers).to(device)
 
@@ -835,9 +736,6 @@ def train(cfg: Dict[str, Any]) -> None:
         F.apply(init_weights_normal)
         D_A.apply(init_weights_normal)
         D_B.apply(init_weights_normal)
-        if use_global_residual:
-            zero_init_module(G.output_conv)
-            zero_init_module(F.output_conv)
 
     fake_a_buffer = ReplayBuffer(max_size=max(0, fake_buffer_size), p_use_history=fake_buffer_prob)
     fake_b_buffer = ReplayBuffer(max_size=max(0, fake_buffer_size), p_use_history=fake_buffer_prob)
@@ -845,7 +743,8 @@ def train(cfg: Dict[str, Any]) -> None:
     # visualization setup (lazy load VAE)
     vae = None
     vae_scaling_factor = 0.18215
-    vae_name, vae_subfolder = resolve_vae_source(cfg, vis_cfg)
+    vae_name = vis_cfg.get("vae_model_name_or_path")
+    vae_subfolder = vis_cfg.get("vae_subfolder")
     if isinstance(vis_cfg.get("vae_scaling_factor"), (float, int)):
         vae_scaling_factor = float(vis_cfg.get("vae_scaling_factor"))
 
@@ -1080,7 +979,7 @@ def train(cfg: Dict[str, Any]) -> None:
             else:
                 if vae is None:
                     log_message("Loading VAE for visualization...")
-                    vae = _load_vae(vae_name, vae_subfolder, device)
+                    vae = _load_vae(vae_name, vae_subfolder if isinstance(vae_subfolder, str) else None, device)
 
                 from torchvision.utils import make_grid, save_image  # type: ignore
 

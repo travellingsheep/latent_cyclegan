@@ -1,0 +1,338 @@
+diff --git a/train_baseline.py b/train_latent_cyclegan.py
+index 5732221..81b9b0f 100644
+--- a/train_baseline.py
++++ b/train_latent_cyclegan.py
+@@ -50,28 +50,76 @@ def set_seed(seed: int) -> None:
+     torch.cuda.manual_seed_all(seed)
+ 
+ 
+-def init_weights_normal(m: nn.Module, mean: float = 0.0, std: float = 0.02) -> None:
+-    classname = m.__class__.__name__
+-    if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
+-        if hasattr(m, "weight") and m.weight is not None:
+-            nn.init.normal_(m.weight.data, mean=mean, std=std)
++def init_weights_normal(m: nn.Module, mean: float = 0.0, std: float = 0.02) -> None:
++    classname = m.__class__.__name__
++    if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
++        if hasattr(m, "weight") and m.weight is not None:
++            nn.init.normal_(m.weight.data, mean=mean, std=std)
+         if hasattr(m, "bias") and m.bias is not None:
+             nn.init.constant_(m.bias.data, 0.0)
+     elif isinstance(m, (nn.BatchNorm2d, nn.InstanceNorm2d)):
+         # Only applies if affine=True; ours uses affine=False, so usually no params here.
+         if getattr(m, "weight", None) is not None:
+             nn.init.normal_(m.weight.data, mean=1.0, std=std)
+-        if getattr(m, "bias", None) is not None:
+-            nn.init.constant_(m.bias.data, 0.0)
+-
+-
+-def _ensure_dir(path: str) -> None:
+-    os.makedirs(path, exist_ok=True)
+-
+-
+-def _default_checkpoint_dir() -> str:
+-    # As requested: keep checkpoints under ./outputs/model
+-    return os.path.join("outputs", "model")
++        if getattr(m, "bias", None) is not None:
++            nn.init.constant_(m.bias.data, 0.0)
++
++
++def zero_init_module(m: nn.Module) -> None:
++    if hasattr(m, "weight") and getattr(m, "weight", None) is not None:
++        nn.init.constant_(m.weight.data, 0.0)
++    if hasattr(m, "bias") and getattr(m, "bias", None) is not None:
++        nn.init.constant_(m.bias.data, 0.0)
++
++
++def _ensure_dir(path: str) -> None:
++    os.makedirs(path, exist_ok=True)
++
++
++def _recover_user_path(text: str) -> str:
++    normalized = text.strip()
++    if "~" not in normalized:
++        return normalized
++
++    parts = Path(normalized).parts
++    if "~" not in parts:
++        return normalized
++
++    tilde_idx = parts.index("~")
++    return str(Path("~").joinpath(*parts[tilde_idx + 1 :]))
++
++
++def _normalize_model_name_or_path(model_name_or_path: str) -> str:
++    raw = _recover_user_path(model_name_or_path)
++    if raw.startswith("~"):
++        return str(Path(raw).expanduser())
++    return raw
++
++
++def resolve_vae_source(cfg: Dict[str, Any], vis_cfg: Dict[str, Any]) -> Tuple[str, Optional[str]]:
++    shared_cfg = cfg.get("shared", {})
++    if not isinstance(shared_cfg, dict):
++        shared_cfg = {}
++
++    shared_vae_name = shared_cfg.get("vae_model_name_or_path")
++    if isinstance(shared_vae_name, str) and shared_vae_name.strip():
++        vae_name = shared_vae_name.strip()
++    else:
++        vae_name = str(vis_cfg.get("vae_model_name_or_path", "") or "").strip()
++
++    if "vae_subfolder" in shared_cfg:
++        shared_subfolder = str(shared_cfg.get("vae_subfolder", "") or "").strip()
++        vae_subfolder = shared_subfolder if shared_subfolder else None
++    else:
++        vis_subfolder = str(vis_cfg.get("vae_subfolder", "") or "").strip()
++        vae_subfolder = vis_subfolder if vis_subfolder else None
++
++    return vae_name, vae_subfolder
++
++
++def _default_checkpoint_dir() -> str:
++    # As requested: keep checkpoints under ./outputs/model
++    return os.path.join("outputs", "model")
+ 
+ 
+ def _checkpoint_last_path(ckpt_dir: str) -> str:
+@@ -347,21 +395,32 @@ def get_infinite_iterator(dataloader: DataLoader) -> Iterator[torch.Tensor]:
+ 
+ 
+ class ResnetBlock(nn.Module):
+-    def __init__(self, dim: int):
++    def __init__(self, dim: int, use_pointwise_only: bool = False):
+         super().__init__()
+-        self.block = nn.Sequential(
+-            nn.ReflectionPad2d(1),
+-            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, groups=dim, bias=False),
+-            # nn.ReflectionPad2d(1),
+-            nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False),
+-            nn.InstanceNorm2d(dim, affine=False, track_running_stats=False),
+-            nn.ReLU(inplace=True),
+-            # nn.ReflectionPad2d(1),
+-            nn.ReflectionPad2d(1),
+-            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, groups=dim, bias=False),
+-            nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False),
+-            nn.InstanceNorm2d(dim, affine=False, track_running_stats=False),
+-        )
++        layers: List[nn.Module] = []
++        if use_pointwise_only:
++            layers += [
++                # nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, groups=dim, bias=False),
++                nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False),
++                nn.InstanceNorm2d(dim, affine=False, track_running_stats=False),
++                nn.ReLU(inplace=True),
++                # nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, groups=dim, bias=False),
++                nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False),
++                nn.InstanceNorm2d(dim, affine=False, track_running_stats=False),
++            ]
++        else:
++            layers += [
++                nn.ReflectionPad2d(1),
++                nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, groups=dim, bias=False),
++                nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False),
++                nn.InstanceNorm2d(dim, affine=False, track_running_stats=False),
++                nn.ReLU(inplace=True),
++                nn.ReflectionPad2d(1),
++                nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=0, groups=dim, bias=False),
++                nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False),
++                nn.InstanceNorm2d(dim, affine=False, track_running_stats=False),
++            ]
++        self.block = nn.Sequential(*layers)
+ 
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
+         return x + self.block(x)
+@@ -375,39 +434,60 @@ class ResnetGenerator(nn.Module):
+         ngf: int = 32,
+         n_res_blocks: int = 6,
+         out_activation: str = "none",
++        use_global_residual: bool = False,
++        use_pointwise_only: bool = False,
+     ):
+         super().__init__()
++        self.use_global_residual = use_global_residual
+         layers: List[nn.Module] = []
+ 
+         # c7s1
+-        layers += [
+-            nn.ReflectionPad2d(2),
+-            nn.Conv2d(in_ch, ngf, kernel_size=5, stride=1, padding=0, bias=False),
+-            nn.InstanceNorm2d(ngf, affine=False, track_running_stats=False),
+-            nn.ReLU(inplace=True),
+-        ]
++        if use_pointwise_only:
++            layers += [
++                nn.Conv2d(in_ch, ngf, kernel_size=1, stride=1, padding=0, bias=False),
++                nn.InstanceNorm2d(ngf, affine=False, track_running_stats=False),
++                nn.ReLU(inplace=True),
++            ]
++        else:
++            layers += [
++                nn.ReflectionPad2d(2),
++                nn.Conv2d(in_ch, ngf, kernel_size=5, stride=1, padding=0, bias=False),
++                nn.InstanceNorm2d(ngf, affine=False, track_running_stats=False),
++                nn.ReLU(inplace=True),
++            ]
+ 
+         # res blocks
+         for _ in range(n_res_blocks):
+-            layers += [ResnetBlock(ngf)]
++            layers += [ResnetBlock(ngf, use_pointwise_only=use_pointwise_only)]
+ 
+         # output
+-        layers += [
+-            nn.ReflectionPad2d(2),
+-            nn.Conv2d(ngf, out_ch, kernel_size=5, stride=1, padding=0, bias=True),
+-        ]
++        if use_pointwise_only:
++            layers += [
++                nn.Conv2d(ngf, out_ch, kernel_size=1, stride=1, padding=0, bias=True),
++            ]
++        else:
++            layers += [
++                nn.ReflectionPad2d(2),
++                nn.Conv2d(ngf, out_ch, kernel_size=5, stride=1, padding=0, bias=True),
++            ]
+ 
+         if out_activation.lower() == "tanh":
+             layers += [nn.Tanh()]
+         elif out_activation.lower() in ("none", "identity", "linear", ""):
+             pass
+-        else:
+-            raise ValueError(f"Unsupported out_activation: {out_activation}")
+-
+-        self.net = nn.Sequential(*layers)
+-
+-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+-        return self.net(x)
++        else:
++            raise ValueError(f"Unsupported out_activation: {out_activation}")
++
++        self.net = nn.Sequential(*layers)
++        self.output_conv = next(
++            module for module in reversed(self.net) if isinstance(module, nn.Conv2d)
++        )
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        out = self.net(x)
++        if self.use_global_residual:
++            return x + out
++        return out
+ 
+ 
+ class PatchDiscriminator(nn.Module):
+@@ -444,17 +524,18 @@ class PatchDiscriminator(nn.Module):
+ 
+ 
+ @torch.no_grad()
+-def _load_vae(model_name_or_path: str, subfolder: Optional[str], device: torch.device) -> nn.Module:
+-    try:
+-        from diffusers import AutoencoderKL  # type: ignore
+-    except Exception as e:  # pragma: no cover
+-        raise RuntimeError(
+-            "Missing dependency 'diffusers'. Install it: pip install diffusers transformers accelerate safetensors"
+-        ) from e
+-
+-    kwargs: Dict[str, Any] = {}
+-    if subfolder:
+-        kwargs["subfolder"] = subfolder
++def _load_vae(model_name_or_path: str, subfolder: Optional[str], device: torch.device) -> nn.Module:
++    try:
++        from diffusers import AutoencoderKL  # type: ignore
++    except Exception as e:  # pragma: no cover
++        raise RuntimeError(
++            "Missing dependency 'diffusers'. Install it: pip install diffusers transformers accelerate safetensors"
++        ) from e
++
++    model_name_or_path = _normalize_model_name_or_path(model_name_or_path)
++    kwargs: Dict[str, Any] = {}
++    if subfolder:
++        kwargs["subfolder"] = subfolder
+ 
+     vae = AutoencoderKL.from_pretrained(model_name_or_path, **kwargs)
+     vae.to(device)
+@@ -678,9 +759,27 @@ def train(cfg: Dict[str, Any]) -> None:
+     n_res_blocks = int(model_cfg.get("n_res_blocks", 6))
+     d_layers = int(model_cfg.get("d_layers", 3))
+     out_activation = str(model_cfg.get("out_activation", "none"))
+-
+-    G = ResnetGenerator(in_ch=in_ch, out_ch=out_ch, ngf=ngf, n_res_blocks=n_res_blocks, out_activation=out_activation).to(device)
+-    F = ResnetGenerator(in_ch=in_ch, out_ch=out_ch, ngf=ngf, n_res_blocks=n_res_blocks, out_activation=out_activation).to(device)
++    use_global_residual = bool(model_cfg.get("use_global_residual", False))
++    use_pointwise_only = bool(model_cfg.get("use_pointwise_only", False))
++
++    G = ResnetGenerator(
++        in_ch=in_ch,
++        out_ch=out_ch,
++        ngf=ngf,
++        n_res_blocks=n_res_blocks,
++        out_activation=out_activation,
++        use_global_residual=use_global_residual,
++        use_pointwise_only=use_pointwise_only,
++    ).to(device)
++    F = ResnetGenerator(
++        in_ch=in_ch,
++        out_ch=out_ch,
++        ngf=ngf,
++        n_res_blocks=n_res_blocks,
++        out_activation=out_activation,
++        use_global_residual=use_global_residual,
++        use_pointwise_only=use_pointwise_only,
++    ).to(device)
+     D_A = PatchDiscriminator(in_ch=in_ch, ndf=ndf, n_layers=d_layers).to(device)
+     D_B = PatchDiscriminator(in_ch=in_ch, ndf=ndf, n_layers=d_layers).to(device)
+ 
+@@ -730,23 +829,25 @@ def train(cfg: Dict[str, Any]) -> None:
+         else:
+             log_message(f"[warn] resume enabled but checkpoint not found: {candidate}. Start from scratch.")
+ 
+-    if not resumed_from_checkpoint:
+-        # Init weights from N(0, 0.02) only when starting from scratch
+-        G.apply(init_weights_normal)
+-        F.apply(init_weights_normal)
+-        D_A.apply(init_weights_normal)
+-        D_B.apply(init_weights_normal)
+-
+-    fake_a_buffer = ReplayBuffer(max_size=max(0, fake_buffer_size), p_use_history=fake_buffer_prob)
++    if not resumed_from_checkpoint:
++        # Init weights from N(0, 0.02) only when starting from scratch
++        G.apply(init_weights_normal)
++        F.apply(init_weights_normal)
++        D_A.apply(init_weights_normal)
++        D_B.apply(init_weights_normal)
++        if use_global_residual:
++            zero_init_module(G.output_conv)
++            zero_init_module(F.output_conv)
++
++    fake_a_buffer = ReplayBuffer(max_size=max(0, fake_buffer_size), p_use_history=fake_buffer_prob)
+     fake_b_buffer = ReplayBuffer(max_size=max(0, fake_buffer_size), p_use_history=fake_buffer_prob)
+ 
+-    # visualization setup (lazy load VAE)
+-    vae = None
+-    vae_scaling_factor = 0.18215
+-    vae_name = vis_cfg.get("vae_model_name_or_path")
+-    vae_subfolder = vis_cfg.get("vae_subfolder")
+-    if isinstance(vis_cfg.get("vae_scaling_factor"), (float, int)):
+-        vae_scaling_factor = float(vis_cfg.get("vae_scaling_factor"))
++    # visualization setup (lazy load VAE)
++    vae = None
++    vae_scaling_factor = 0.18215
++    vae_name, vae_subfolder = resolve_vae_source(cfg, vis_cfg)
++    if isinstance(vis_cfg.get("vae_scaling_factor"), (float, int)):
++        vae_scaling_factor = float(vis_cfg.get("vae_scaling_factor"))
+ 
+     os.makedirs(vis_dir, exist_ok=True)
+ 
+@@ -977,9 +1078,9 @@ def train(cfg: Dict[str, Any]) -> None:
+             if not (isinstance(vae_name, str) and vae_name):
+                 log_message("[warn] visualization.vae_model_name_or_path not set; skip visualization")
+             else:
+-                if vae is None:
+-                    log_message("Loading VAE for visualization...")
+-                    vae = _load_vae(vae_name, vae_subfolder if isinstance(vae_subfolder, str) else None, device)
++                if vae is None:
++                    log_message("Loading VAE for visualization...")
++                    vae = _load_vae(vae_name, vae_subfolder, device)
+ 
+                 from torchvision.utils import make_grid, save_image  # type: ignore
+ 

@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
 from torchvision import transforms
@@ -28,6 +29,7 @@ from train_latent_cyclegan import (  # noqa: E402
     _load_vae,
     decode_latents_to_images,
     load_yaml_config,
+    resolve_vae_source,
 )
 
 
@@ -36,6 +38,7 @@ IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
 
 @dataclass
 class EvalConfig:
+    shared_cfg: Dict[str, Any]
     model_cfg: Dict[str, Any]
     data_cfg: Dict[str, Any]
     vis_cfg: Dict[str, Any]
@@ -284,6 +287,92 @@ def _load_clip_model(eval_cfg: Dict[str, Any], device: torch.device):
     return clip_backbone_id, model, processor
 
 
+class _CleanFIDTorchscriptWrapper(nn.Module):
+    def __init__(self, scripted_model, resize_inside: bool = False):
+        super().__init__()
+        self.base = scripted_model.eval()
+        self.layers = self.base.layers
+        self.resize_inside = resize_inside
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from cleanfid.inception_torchscript import disable_gpu_fuser_on_pt19
+
+        with disable_gpu_fuser_on_pt19():
+            bs = x.shape[0]
+            if self.resize_inside:
+                return self.base(x, return_features=True).view((bs, 2048))
+            assert (x.shape[2] == 299) and (x.shape[3] == 299)
+            x = (x - 128) / 128
+            return self.layers.forward(x).view((bs, 2048))
+
+
+def _build_cleanfid_feature_extractor(shared_cfg: Dict[str, Any], eval_cfg: Dict[str, Any], device: torch.device):
+    from cleanfid import fid
+
+    def _build_default():
+        default_path = Path("/tmp/inception-2015-12-05.pt")
+        if default_path.exists():
+            _log(f"[Phase3][Info] Using cleanfid default Inception weights: {default_path}")
+        else:
+            _log(
+                "[Phase3][Warn] Falling back to cleanfid default Inception weights; "
+                f"weights will be downloaded to {default_path}"
+            )
+        return fid.build_feature_extractor(mode="clean", device=device, use_dataparallel=False)
+
+    raw_path = str(
+        eval_cfg.get("cleanfid_inception_path", "") or shared_cfg.get("cleanfid_inception_path", "") or ""
+    ).strip()
+    if not raw_path:
+        return _build_default()
+
+    path = _resolve_repo_path(raw_path)
+    if not path.exists():
+        _log(
+            "[Phase3][Warn] Configured cleanfid inception path does not exist: "
+            f"{path}. Falling back to default cleanfid weights."
+        )
+        return _build_default()
+    _log(f"[Phase3][Info] Using configured cleanfid inception weights: {path}")
+
+    if path.is_dir():
+        expected = path / "inception-2015-12-05.pt"
+        if not expected.exists():
+            _log(
+                "[Phase3][Warn] Configured cleanfid inception directory does not contain "
+                f"inception-2015-12-05.pt: {path}. Falling back to default cleanfid weights."
+            )
+            return _build_default()
+        from cleanfid.inception_torchscript import InceptionV3W
+
+        model = InceptionV3W(str(path), download=False, resize_inside=False).to(device)
+    else:
+        try:
+            scripted_model = torch.jit.load(str(path)).eval()
+        except Exception as exc:
+            state_dict_hint = ""
+            try:
+                maybe_obj = torch.load(str(path), map_location="cpu")
+                if isinstance(maybe_obj, dict):
+                    state_dict_hint = (
+                        " The file looks like a regular PyTorch state_dict (.pth), not the "
+                        "TorchScript cleanfid Inception weights."
+                    )
+            except Exception:
+                pass
+            _log(
+                "[Phase3][Warn] Invalid cleanfid inception weights file: "
+                f"{path}. Expected the TorchScript file 'inception-2015-12-05.pt' or a directory containing it."
+                f"{state_dict_hint} Original error: {exc}"
+            )
+            _log("[Phase3][Warn] Falling back to default cleanfid weights.")
+            return _build_default()
+        model = _CleanFIDTorchscriptWrapper(scripted_model, resize_inside=False).to(device)
+
+    model.eval()
+    return lambda x: model(x)
+
+
 def _to_feature_tensor(output: Any) -> torch.Tensor:
     if torch.is_tensor(output):
         return output
@@ -333,7 +422,16 @@ def _phase0_parse_config(args: argparse.Namespace) -> EvalConfig:
         experiment_config_path = experiment_dir / "config.yaml"
         _require(experiment_dir.exists(), f"cyclegan_eval.experiment_dir not found: {experiment_dir}")
         _require(experiment_config_path.exists(), f"experiment config not found: {experiment_config_path}")
+        base_cfg = cfg
         cfg = load_yaml_config(str(experiment_config_path))
+        merged_shared_cfg = cfg.get("shared", {})
+        _require(isinstance(merged_shared_cfg, dict), "experiment config.shared must be a dict")
+        merged_shared_cfg = dict(merged_shared_cfg)
+        initial_shared_cfg = base_cfg.get("shared", {})
+        _require(isinstance(initial_shared_cfg, dict), "config.shared must be a dict")
+        merged_shared_cfg.update(initial_shared_cfg)
+        cfg["shared"] = merged_shared_cfg
+
         merged_eval_cfg = cfg.get("cyclegan_eval", {})
         _require(isinstance(merged_eval_cfg, dict), "experiment config.cyclegan_eval must be a dict")
         merged_eval_cfg = dict(merged_eval_cfg)
@@ -342,10 +440,12 @@ def _phase0_parse_config(args: argparse.Namespace) -> EvalConfig:
         cfg["cyclegan_eval"] = merged_eval_cfg
 
     model_cfg = cfg.get("model", {})
+    shared_cfg = cfg.get("shared", {})
     vis_cfg = cfg.get("visualization", {})
     eval_cfg = cfg.get("cyclegan_eval", {})
     data_cfg = cfg.get("data", {})
 
+    _require(isinstance(shared_cfg, dict), "config.shared must be a dict")
     _require(isinstance(model_cfg, dict), "config.model must be a dict")
     _require(isinstance(vis_cfg, dict), "config.visualization must be a dict")
     _require(isinstance(eval_cfg, dict), "config.cyclegan_eval must be a dict")
@@ -420,6 +520,7 @@ def _phase0_parse_config(args: argparse.Namespace) -> EvalConfig:
     reference_cache_dir.mkdir(parents=True, exist_ok=True)
 
     return EvalConfig(
+        shared_cfg=shared_cfg,
         model_cfg=model_cfg,
         data_cfg=data_cfg,
         vis_cfg=vis_cfg,
@@ -448,8 +549,6 @@ def _phase1_build_or_load_ref_cache(
     clip_runtime: Optional[Dict[str, Any]] = None,
     force_regen_cache: bool = False,
 ) -> Dict[str, Any]:
-    from cleanfid import fid
-
     cleanfid_model = None
 
     if clip_runtime is None:
@@ -485,11 +584,7 @@ def _phase1_build_or_load_ref_cache(
                 ref_paths = random.sample(ref_paths, ref_cache_max_images)
 
         if cleanfid_model is None:
-            cleanfid_model = fid.build_feature_extractor(
-                mode="clean",
-                device=ecfg.run_device,
-                use_dataparallel=False,
-            )
+            cleanfid_model = _build_cleanfid_feature_extractor(ecfg.shared_cfg, ecfg.eval_cfg, ecfg.run_device)
 
         cleanfid_features = fid.get_folder_features(
             fdir=str(reference_rgb_dir),
@@ -756,7 +851,7 @@ def _phase3_metrics(
 ) -> Dict[str, Any]:
     from cleanfid import fid
 
-    cleanfid_model = fid.build_feature_extractor(mode="clean", device=ecfg.run_device, use_dataparallel=False)
+    cleanfid_model = _build_cleanfid_feature_extractor(ecfg.shared_cfg, ecfg.eval_cfg, ecfg.run_device)
 
     disable_lpips = bool(ecfg.eval_cfg.get("skip_lpips", False))
     disable_clip = bool(ecfg.eval_cfg.get("skip_clip", False))
@@ -1023,9 +1118,10 @@ def main() -> None:
     generators = _load_generators(ecfg)
 
     _log("[Setup] Loading VAE once for all directions...")
+    vae_name, vae_subfolder = resolve_vae_source({"shared": ecfg.shared_cfg}, ecfg.vis_cfg)
     vae = _load_vae(
-        model_name_or_path=str(ecfg.vis_cfg.get("vae_model_name_or_path", "runwayml/stable-diffusion-v1-5")),
-        subfolder=str(ecfg.vis_cfg.get("vae_subfolder", "vae") or "vae"),
+        model_name_or_path=vae_name or "runwayml/stable-diffusion-v1-5",
+        subfolder=vae_subfolder,
         device=ecfg.run_device,
     )
 

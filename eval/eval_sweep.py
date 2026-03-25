@@ -25,11 +25,15 @@ class RunResult:
     run_name: str
     run_dir: Path
     status: str
+    batch_size: Optional[int] = None
     message: str = ""
     return_code: Optional[int] = None
     summary: Optional[Dict[str, Any]] = None
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sweep evaluator for latent CycleGAN runs")
     parser.add_argument(
@@ -80,7 +84,7 @@ def resolve_exp_root(config_path: Path, cfg: Dict[str, Any], exp_root_override: 
     if not isinstance(exp_root, str) or not exp_root.strip():
         raise ValueError("exp_root missing in config and --exp_root not provided")
 
-    raw = Path(exp_root)
+    raw = Path(exp_root).expanduser()
     if raw.is_absolute():
         return raw
     return (config_path.parent / raw).resolve()
@@ -113,12 +117,41 @@ def _set_nested_path_if_present(cfg: Dict[str, Any], keys: Tuple[str, ...], conf
         cur[leaf] = _resolve_path_value(config_dir, value)
 
 
-def write_resolved_eval_config(source_config_path: Path, exp_root: Path, output_path: Path) -> Path:
+def _get_nested_value(cfg: Dict[str, Any], keys: Tuple[str, ...]) -> Any:
+    cur: Any = cfg
+    for key in keys:
+        if not isinstance(cur, dict) or key not in cur:
+            return None
+        cur = cur[key]
+    return cur
+
+
+def _set_nested_value(cfg: Dict[str, Any], keys: Tuple[str, ...], value: Any) -> None:
+    cur: Dict[str, Any] = cfg
+    for key in keys[:-1]:
+        next_value = cur.get(key)
+        if not isinstance(next_value, dict):
+            next_value = {}
+            cur[key] = next_value
+        cur = next_value
+    cur[keys[-1]] = value
+
+
+def write_resolved_eval_config(
+    source_config_path: Path,
+    base_config_path: Path,
+    exp_root: Path,
+    run_dir: Path,
+    output_path: Path,
+) -> Path:
     cfg = load_yaml(source_config_path)
-    config_dir = source_config_path.parent.resolve()
+    base_cfg = load_yaml(base_config_path)
+    config_dir = base_config_path.parent.resolve()
 
     path_fields: List[Tuple[str, ...]] = [
         ("exp_root",),
+        ("shared", "vae_model_name_or_path"),
+        ("shared", "cleanfid_inception_path"),
         ("data", "a_dir"),
         ("data", "b_dir"),
         ("train", "checkpoint_dir"),
@@ -137,7 +170,40 @@ def write_resolved_eval_config(source_config_path: Path, exp_root: Path, output_
     for field_keys in path_fields:
         _set_nested_path_if_present(cfg, field_keys, config_dir)
 
+    inherited_base_fields: List[Tuple[str, ...]] = [
+        ("shared", "vae_model_name_or_path"),
+        ("shared", "cleanfid_inception_path"),
+        ("cyclegan_eval", "base_latent_dir"),
+        ("cyclegan_eval", "base_orig_rgb_dir"),
+        ("cyclegan_eval", "base_vae_recon_dir"),
+        ("cyclegan_eval", "reference_cache_dir"),
+        ("cyclegan_eval", "clip_model_cache_dir"),
+    ]
+    for field_keys in inherited_base_fields:
+        base_value = _get_nested_value(base_cfg, field_keys)
+        if isinstance(base_value, str):
+            if base_value.strip():
+                _set_nested_value(cfg, field_keys, _resolve_path_value(config_dir, base_value))
+            continue
+        if base_value is not None:
+            _set_nested_value(cfg, field_keys, base_value)
+
+    inherited_literal_fields: List[Tuple[str, ...]] = [
+        ("cyclegan_eval", "clip_backbone_id"),
+        ("cyclegan_eval", "clip_local_only"),
+        ("cyclegan_eval", "clip_use_safetensors"),
+    ]
+    for field_keys in inherited_literal_fields:
+        base_value = _get_nested_value(base_cfg, field_keys)
+        if base_value is not None:
+            _set_nested_value(cfg, field_keys, base_value)
+
     cfg["exp_root"] = str(exp_root)
+    eval_cfg = cfg.get("cyclegan_eval", {})
+    if not isinstance(eval_cfg, dict):
+        eval_cfg = {}
+    eval_cfg["experiment_dir"] = str(run_dir)
+    cfg["cyclegan_eval"] = eval_cfg
 
     with output_path.open("w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
@@ -152,6 +218,25 @@ def resolve_reference_cache_dir(config_path: Path, cfg: Dict[str, Any], exp_root
             return Path(_resolve_path_value(config_path.parent.resolve(), raw))
 
     return exp_root / "shared_eval_cache"
+
+
+def get_run_batch_size(config_path: Path) -> Optional[int]:
+    if not config_path.exists():
+        return None
+    try:
+        cfg = load_yaml(config_path)
+    except Exception:
+        return None
+
+    train_cfg = cfg.get("train", {})
+    if not isinstance(train_cfg, dict):
+        return None
+
+    value = train_cfg.get("batch_size")
+    try:
+        return int(value)
+    except Exception:
+        return None
 
 
 def is_valid_existing_run(run_dir: Path) -> Tuple[bool, Optional[Dict[str, Any]], str]:
@@ -314,6 +399,7 @@ def write_global_summary(exp_root: Path, results: List[RunResult]) -> None:
         row: Dict[str, Any] = {
             "run_name": result.run_name,
             "status": result.status,
+            "batch_size": result.batch_size if result.batch_size is not None else "",
         }
         if result.summary:
             row.update(flatten_summary(result.summary))
@@ -321,7 +407,7 @@ def write_global_summary(exp_root: Path, results: List[RunResult]) -> None:
 
     df = pd.DataFrame(rows)
 
-    fixed = ["run_name", "status"]
+    fixed = ["run_name", "batch_size", "status"]
     metric_cols = sorted([c for c in df.columns if c not in fixed])
     ordered_cols = [c for c in fixed if c in df.columns] + metric_cols
     df = df.reindex(columns=ordered_cols)
@@ -338,11 +424,10 @@ def collect_run_dirs(exp_root: Path) -> List[Path]:
 
 def main() -> None:
     args = parse_args()
-    repo_root = Path(__file__).resolve().parent
 
     config_path = Path(args.config).expanduser()
     if not config_path.is_absolute():
-        config_path = (repo_root / config_path).resolve()
+        config_path = (REPO_ROOT / config_path).resolve()
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
@@ -353,7 +438,7 @@ def main() -> None:
 
     evaluate_script = Path(args.evaluate_script).expanduser()
     if not evaluate_script.is_absolute():
-        evaluate_script = (repo_root / evaluate_script).resolve()
+        evaluate_script = (REPO_ROOT / evaluate_script).resolve()
 
     shared_cache_dir = resolve_reference_cache_dir(config_path, cfg, exp_root)
     run_dirs = collect_run_dirs(exp_root)
@@ -373,12 +458,16 @@ def main() -> None:
 
         run_config_path = run_dir / "config.yaml"
         source_config_path = run_config_path if run_config_path.exists() else config_path
+        run_batch_size = get_run_batch_size(source_config_path)
         resolved_config_path = write_resolved_eval_config(
             source_config_path=source_config_path,
+            base_config_path=config_path,
             exp_root=exp_root,
+            run_dir=run_dir,
             output_path=run_dir / "eval_resolved_config.yaml",
         )
         log(f"[RUN] Using config source: {source_config_path}")
+        log(f"[RUN] batch_size: {run_batch_size if run_batch_size is not None else 'unknown'}")
         log(f"[RUN] Resolved eval config: {resolved_config_path}")
 
         valid_existing, existing_summary, msg = is_valid_existing_run(run_dir)
@@ -389,6 +478,7 @@ def main() -> None:
                     run_name=run_name,
                     run_dir=run_dir,
                     status="skipped_existing",
+                    batch_size=run_batch_size,
                     message="already evaluated",
                     summary=existing_summary,
                 )
@@ -403,7 +493,7 @@ def main() -> None:
                 evaluate_script=evaluate_script,
                 python_exec=args.python_exec,
                 shared_cache_dir=shared_cache_dir,
-                repo_root=repo_root,
+                repo_root=REPO_ROOT,
                 force_regen_cache=args.force_regen_cache,
             )
             if return_code != 0:
@@ -414,6 +504,7 @@ def main() -> None:
                         run_name=run_name,
                         run_dir=run_dir,
                         status="failed",
+                        batch_size=run_batch_size,
                         message=err_msg,
                         return_code=return_code,
                     )
@@ -427,6 +518,7 @@ def main() -> None:
                     run_name=run_name,
                     run_dir=run_dir,
                     status="success",
+                    batch_size=run_batch_size,
                     message="evaluated",
                     return_code=0,
                     summary=run_summary,
@@ -439,6 +531,7 @@ def main() -> None:
                     run_name=run_name,
                     run_dir=run_dir,
                     status="failed",
+                    batch_size=run_batch_size,
                     message=str(exc),
                 )
             )

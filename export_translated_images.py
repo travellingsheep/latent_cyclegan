@@ -15,11 +15,13 @@ from train_latent_cyclegan import (
     decode_latents_to_images,
     load_latent_tensor,
     load_yaml_config,
+    resolve_vae_source,
 )
 
 
 @dataclass
 class ExportConfig:
+    shared_cfg: Dict[str, Any]
     model_cfg: Dict[str, Any]
     data_cfg: Dict[str, Any]
     vis_cfg: Dict[str, Any]
@@ -178,12 +180,14 @@ def _load_generators(model_path: Path, model_cfg: Dict[str, Any], device: torch.
 def _phase0_parse_config(args: argparse.Namespace) -> ExportConfig:
     cfg = load_yaml_config(args.config)
 
+    shared_cfg = cfg.get("shared", {})
     model_cfg = cfg.get("model", {})
     data_cfg = cfg.get("data", {})
     vis_cfg = cfg.get("visualization", {})
     export_cfg = cfg.get("image_export", {})
     eval_cfg = cfg.get("cyclegan_eval", {})
 
+    _require(isinstance(shared_cfg, dict), "config.shared must be a dict")
     _require(isinstance(model_cfg, dict), "config.model must be a dict")
     _require(isinstance(data_cfg, dict), "config.data must be a dict")
     _require(isinstance(vis_cfg, dict), "config.visualization must be a dict")
@@ -229,6 +233,7 @@ def _phase0_parse_config(args: argparse.Namespace) -> ExportConfig:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     return ExportConfig(
+        shared_cfg=shared_cfg,
         model_cfg=model_cfg,
         data_cfg=data_cfg,
         vis_cfg=vis_cfg,
@@ -381,9 +386,10 @@ def main() -> None:
     generators = _load_generators(ecfg.model_path, ecfg.model_cfg, ecfg.run_device)
 
     _log("[Setup] Loading VAE...")
+    vae_name, vae_subfolder = resolve_vae_source({"shared": ecfg.shared_cfg}, ecfg.vis_cfg)
     vae = _load_vae(
-        model_name_or_path=str(ecfg.vis_cfg.get("vae_model_name_or_path", "runwayml/stable-diffusion-v1-5")),
-        subfolder=str(ecfg.vis_cfg.get("vae_subfolder", "vae") or "vae"),
+        model_name_or_path=vae_name or "runwayml/stable-diffusion-v1-5",
+        subfolder=vae_subfolder,
         device=ecfg.run_device,
     )
 

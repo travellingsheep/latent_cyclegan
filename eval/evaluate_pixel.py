@@ -163,6 +163,7 @@ class OfficialResnetGenerator(nn.Module):
 
 @dataclass
 class EvalConfig:
+    shared_cfg: Dict[str, Any]
     eval_cfg: Dict[str, Any]
     domain_A_name: str
     domain_B_name: str
@@ -416,6 +417,92 @@ def _load_clip_model(eval_cfg: Dict[str, Any], device: torch.device):
     return clip_backbone_id, model, processor
 
 
+class _CleanFIDTorchscriptWrapper(nn.Module):
+    def __init__(self, scripted_model, resize_inside: bool = False):
+        super().__init__()
+        self.base = scripted_model.eval()
+        self.layers = self.base.layers
+        self.resize_inside = resize_inside
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from cleanfid.inception_torchscript import disable_gpu_fuser_on_pt19
+
+        with disable_gpu_fuser_on_pt19():
+            bs = x.shape[0]
+            if self.resize_inside:
+                return self.base(x, return_features=True).view((bs, 2048))
+            assert (x.shape[2] == 299) and (x.shape[3] == 299)
+            x = (x - 128) / 128
+            return self.layers.forward(x).view((bs, 2048))
+
+
+def _build_cleanfid_feature_extractor(shared_cfg: Dict[str, Any], eval_cfg: Dict[str, Any], device: torch.device):
+    from cleanfid import fid
+
+    def _build_default():
+        default_path = Path("/tmp/inception-2015-12-05.pt")
+        if default_path.exists():
+            _log(f"[Phase3][Info] Using cleanfid default Inception weights: {default_path}")
+        else:
+            _log(
+                "[Phase3][Warn] Falling back to cleanfid default Inception weights; "
+                f"weights will be downloaded to {default_path}"
+            )
+        return fid.build_feature_extractor(mode="clean", device=device, use_dataparallel=False)
+
+    raw_path = str(
+        eval_cfg.get("cleanfid_inception_path", "") or shared_cfg.get("cleanfid_inception_path", "") or ""
+    ).strip()
+    if not raw_path:
+        return _build_default()
+
+    path = _resolve_repo_path(raw_path)
+    if not path.exists():
+        _log(
+            "[Phase3][Warn] Configured cleanfid inception path does not exist: "
+            f"{path}. Falling back to default cleanfid weights."
+        )
+        return _build_default()
+    _log(f"[Phase3][Info] Using configured cleanfid inception weights: {path}")
+
+    if path.is_dir():
+        expected = path / "inception-2015-12-05.pt"
+        if not expected.exists():
+            _log(
+                "[Phase3][Warn] Configured cleanfid inception directory does not contain "
+                f"inception-2015-12-05.pt: {path}. Falling back to default cleanfid weights."
+            )
+            return _build_default()
+        from cleanfid.inception_torchscript import InceptionV3W
+
+        model = InceptionV3W(str(path), download=False, resize_inside=False).to(device)
+    else:
+        try:
+            scripted_model = torch.jit.load(str(path)).eval()
+        except Exception as exc:
+            state_dict_hint = ""
+            try:
+                maybe_obj = torch.load(str(path), map_location="cpu")
+                if isinstance(maybe_obj, dict):
+                    state_dict_hint = (
+                        " The file looks like a regular PyTorch state_dict (.pth), not the "
+                        "TorchScript cleanfid Inception weights."
+                    )
+            except Exception:
+                pass
+            _log(
+                "[Phase3][Warn] Invalid cleanfid inception weights file: "
+                f"{path}. Expected the TorchScript file 'inception-2015-12-05.pt' or a directory containing it."
+                f"{state_dict_hint} Original error: {exc}"
+            )
+            _log("[Phase3][Warn] Falling back to default cleanfid weights.")
+            return _build_default()
+        model = _CleanFIDTorchscriptWrapper(scripted_model, resize_inside=False).to(device)
+
+    model.eval()
+    return lambda x: model(x)
+
+
 def _to_feature_tensor(output: Any) -> torch.Tensor:
     if torch.is_tensor(output):
         return output
@@ -453,7 +540,9 @@ def _clip_image_features(
 def _phase0_parse_config(args: argparse.Namespace) -> EvalConfig:
     config_path = _resolve_repo_path(args.config)
     cfg = load_yaml_config(str(config_path))
+    shared_cfg = cfg.get("shared", {})
     eval_cfg = cfg.get("pixel_cyclegan_eval", {})
+    _require(isinstance(shared_cfg, dict), "config.shared must be a dict")
     _require(isinstance(eval_cfg, dict), "config.pixel_cyclegan_eval must be a dict")
 
     domain_A_name = str(eval_cfg.get("domain_A_name", "") or "").strip()
@@ -502,6 +591,7 @@ def _phase0_parse_config(args: argparse.Namespace) -> EvalConfig:
     reference_cache_dir.mkdir(parents=True, exist_ok=True)
 
     return EvalConfig(
+        shared_cfg=shared_cfg,
         eval_cfg=eval_cfg,
         domain_A_name=domain_A_name,
         domain_B_name=domain_B_name,
@@ -529,7 +619,7 @@ def _phase1_build_or_load_ref_cache(
 ) -> Dict[str, Any]:
     from cleanfid import fid
 
-    cleanfid_model = fid.build_feature_extractor(mode="clean", device=ecfg.run_device, use_dataparallel=False)
+    cleanfid_model = _build_cleanfid_feature_extractor(ecfg.shared_cfg, ecfg.eval_cfg, ecfg.run_device)
     disable_clip = bool(ecfg.eval_cfg.get("skip_clip", False))
 
     clip_model_id = "clip_skipped"
@@ -789,7 +879,7 @@ def _phase3_metrics(
 ) -> Dict[str, Any]:
     from cleanfid import fid
 
-    cleanfid_model = fid.build_feature_extractor(mode="clean", device=ecfg.run_device, use_dataparallel=False)
+    cleanfid_model = _build_cleanfid_feature_extractor(ecfg.shared_cfg, ecfg.eval_cfg, ecfg.run_device)
 
     disable_lpips = bool(ecfg.eval_cfg.get("skip_lpips", False))
     disable_clip = bool(ecfg.eval_cfg.get("skip_clip", False))
