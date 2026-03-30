@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 from typing import Any, Dict, List, Tuple
 
 import pandas as pd
@@ -24,6 +25,8 @@ LOSS_METRICS = [
 LR_METRICS = ["lr_G", "lr_D"]
 ALL_METRICS = LOSS_METRICS + LR_METRICS
 DEFAULT_CONFIG_PATH = "configs/example.yaml"
+LOAD_ALL_OPTION = "__load_all__"
+D_VIEW_Y_TICK_STEP = 0.05
 
 
 def resolve_config_path_value(config_path: str, path_value: str) -> str:
@@ -32,6 +35,11 @@ def resolve_config_path_value(config_path: str, path_value: str) -> str:
         return path_value
     config_dir = os.path.dirname(os.path.abspath(config_path)) or os.getcwd()
     return os.path.abspath(os.path.join(config_dir, path_value))
+
+
+def natural_sort_key(text: str) -> List[Any]:
+    """按自然顺序排序字符串，使 batch_size_2 排在 batch_size_16 前。"""
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text)]
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,18 +109,25 @@ def discover_sweep_log_paths(config_path: str, config: Dict[str, Any]) -> List[s
         if os.path.exists(candidate):
             discovered_paths.append(candidate)
 
-    discovered_paths.sort(key=lambda path: os.path.getmtime(path), reverse=True)
+    discovered_paths.sort(key=lambda path: natural_sort_key(os.path.basename(os.path.dirname(os.path.dirname(path)))))
     return discovered_paths
 
 
-def render_log_selector(primary_log_path: str, discovered_log_paths: List[str]) -> str:
-    """渲染日志选择器，支持在基础训练日志和 sweep 日志之间切换。"""
+def build_log_options(primary_log_path: str, discovered_log_paths: List[str]) -> List[str]:
+    """构建日志选项列表，保持主日志优先、实验日志按发现顺序追加。"""
     options: List[str] = []
     if primary_log_path not in options:
         options.append(primary_log_path)
     for path in discovered_log_paths:
         if path not in options:
             options.append(path)
+    return options
+
+
+def render_log_selector(primary_log_path: str, discovered_log_paths: List[str]) -> str:
+    """渲染日志选择器，支持在基础训练日志和 sweep 日志之间切换。"""
+    log_options = build_log_options(primary_log_path, discovered_log_paths)
+    options = [LOAD_ALL_OPTION] + log_options
 
     if "selected_log_path" not in st.session_state:
         default_path = primary_log_path if os.path.exists(primary_log_path) else (discovered_log_paths[0] if discovered_log_paths else primary_log_path)
@@ -125,6 +140,7 @@ def render_log_selector(primary_log_path: str, discovered_log_paths: List[str]) 
             "日志文件",
             options=options,
             index=options.index(st.session_state["selected_log_path"]),
+            format_func=lambda option: "load_all (按顺序加载全部日志)" if option == LOAD_ALL_OPTION else option,
             help="优先读取基础训练日志；若不存在，可切换到 exp_root 下一层实验目录中的 logs/train_log.jsonl。",
         )
         st.session_state["selected_log_path"] = selected
@@ -171,7 +187,13 @@ def load_data(log_path: str) -> Tuple[pd.DataFrame, int]:
     return df, skipped_lines
 
 
-def build_metric_figure(df: pd.DataFrame, metrics: List[str], title: str, log_y: bool = False) -> go.Figure:
+def build_metric_figure(
+    df: pd.DataFrame,
+    metrics: List[str],
+    title: str,
+    log_y: bool = False,
+    y_tick_step: float | None = None,
+) -> go.Figure:
     """基于指标列表构建 Plotly 折线图。"""
     figure = go.Figure()
     available_metrics = [metric for metric in metrics if metric in df.columns]
@@ -200,11 +222,19 @@ def build_metric_figure(df: pd.DataFrame, metrics: List[str], title: str, log_y:
 
     if log_y:
         figure.update_yaxes(type="log")
+    elif y_tick_step is not None:
+        figure.update_yaxes(dtick=y_tick_step)
 
     return figure
 
 
-def render_metric_tab(df: pd.DataFrame, metrics: List[str], title: str, log_y: bool = False) -> None:
+def render_metric_tab(
+    df: pd.DataFrame,
+    metrics: List[str],
+    title: str,
+    log_y: bool = False,
+    y_tick_step: float | None = None,
+) -> None:
     """渲染单个标签页的图表，并对空数据或缺字段做友好提示。"""
     available_metrics = [metric for metric in metrics if metric in df.columns]
     if df.empty:
@@ -214,7 +244,7 @@ def render_metric_tab(df: pd.DataFrame, metrics: List[str], title: str, log_y: b
         st.warning("当前日志文件中没有找到该视图所需的指标字段。")
         return
 
-    figure = build_metric_figure(df, available_metrics, title=title, log_y=log_y)
+    figure = build_metric_figure(df, available_metrics, title=title, log_y=log_y, y_tick_step=y_tick_step)
     st.plotly_chart(figure, use_container_width=True)
 
 
@@ -281,6 +311,114 @@ def render_sidebar(default_config_path: str) -> str:
     return st.session_state["active_config_path"]
 
 
+def render_summary_metrics(df: pd.DataFrame) -> None:
+    """渲染日志摘要指标。"""
+    if df.empty:
+        return
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("日志条数", f"{len(df)}")
+    col2.metric("最新 kimg", f"{df['kimg'].iloc[-1]:.3f}")
+    col3.metric("可用指标数", f"{sum(metric in df.columns for metric in ALL_METRICS)}")
+
+
+def render_single_log_dashboard(df: pd.DataFrame) -> None:
+    """渲染单个日志的 tab 视图。"""
+    overview_tab, g_tab, d_tab, penalty_tab, lr_tab = st.tabs(
+        ["综合主控台 (Overview)", "生成器视图 (G-View)", "判别器视图 (D-View)", "约束惩罚视图 (Penalty-View)", "学习率监控 (LR-View)"]
+    )
+
+    with overview_tab:
+        render_overview_tab(df)
+
+    with g_tab:
+        render_metric_tab(df, ["loss_G", "loss_gan_G", "loss_gan_F"], title="G-View: Generator Metrics vs kimg")
+
+    with d_tab:
+        render_metric_tab(
+            df,
+            ["loss_D", "loss_D_A", "loss_D_B"],
+            title="D-View: Discriminator Metrics vs kimg",
+            y_tick_step=D_VIEW_Y_TICK_STEP,
+        )
+
+    with penalty_tab:
+        render_metric_tab(df, ["loss_cyc", "loss_id"], title="Penalty-View: Constraint Metrics vs kimg")
+
+    with lr_tab:
+        render_metric_tab(df, ["lr_G", "lr_D"], title="LR-View: Learning Rate vs kimg")
+
+
+def render_all_logs_dashboard(log_paths: List[str]) -> None:
+    """按视图分组渲染多个日志，便于在同类图之间做纵向比较。"""
+    valid_paths = [path for path in log_paths if os.path.exists(path)]
+    if not valid_paths:
+        st.warning("当前没有可用日志文件，无法执行 load_all。")
+        return
+
+    st.info(f"当前处于 load_all 模式，共加载 {len(valid_paths)} 个日志。请先选择一个视图，再纵向比较所有日志。")
+
+    overview_tab, g_tab, d_tab, penalty_tab, lr_tab = st.tabs(
+        ["综合主控台 (Overview)", "生成器视图 (G-View)", "判别器视图 (D-View)", "约束惩罚视图 (Penalty-View)", "学习率监控 (LR-View)"]
+    )
+
+    with overview_tab:
+        selected_metrics = st.multiselect(
+            "选择要展示的损失指标",
+            options=LOSS_METRICS,
+            default=["loss_G", "loss_D"],
+            key="load_all_overview_metrics",
+        )
+        use_log_scale = st.checkbox("启用对数 Y 轴 (Log Scale)", value=False, key="load_all_overview_log_scale")
+        if not selected_metrics:
+            st.info("请至少选择一个损失指标后再绘图。")
+        else:
+            for idx, log_path in enumerate(valid_paths):
+                st.divider()
+                st.subheader(f"Log {idx + 1}: {os.path.basename(os.path.dirname(log_path))}")
+                st.caption(log_path)
+                try:
+                    df, skipped_lines = load_data(log_path)
+                except Exception as exc:
+                    st.error(f"读取日志失败: {exc}")
+                    continue
+                if skipped_lines > 0:
+                    st.warning(f"检测到 {skipped_lines} 行损坏或不合法 JSON，已自动跳过。")
+                render_summary_metrics(df)
+                render_metric_tab(
+                    df,
+                    selected_metrics,
+                    title=f"Overview: Loss Metrics vs kimg [{idx + 1}]",
+                    log_y=use_log_scale,
+                )
+
+    for tab, metrics, title in [
+        (g_tab, ["loss_G", "loss_gan_G", "loss_gan_F"], "G-View: Generator Metrics vs kimg"),
+        (d_tab, ["loss_D", "loss_D_A", "loss_D_B"], "D-View: Discriminator Metrics vs kimg"),
+        (penalty_tab, ["loss_cyc", "loss_id"], "Penalty-View: Constraint Metrics vs kimg"),
+        (lr_tab, ["lr_G", "lr_D"], "LR-View: Learning Rate vs kimg"),
+    ]:
+        with tab:
+            for idx, log_path in enumerate(valid_paths):
+                st.divider()
+                st.subheader(f"Log {idx + 1}: {os.path.basename(os.path.dirname(log_path))}")
+                st.caption(log_path)
+                try:
+                    df, skipped_lines = load_data(log_path)
+                except Exception as exc:
+                    st.error(f"读取日志失败: {exc}")
+                    continue
+                if skipped_lines > 0:
+                    st.warning(f"检测到 {skipped_lines} 行损坏或不合法 JSON，已自动跳过。")
+                render_summary_metrics(df)
+                render_metric_tab(
+                    df,
+                    metrics,
+                    title=f"{title} [{idx + 1}]",
+                    y_tick_step=D_VIEW_Y_TICK_STEP if title.startswith("D-View") else None,
+                )
+
+
 def main() -> None:
     """Streamlit 入口函数。"""
     args = parse_args()
@@ -319,6 +457,11 @@ def main() -> None:
         return
 
     log_path = render_log_selector(primary_log_path, discovered_log_paths)
+    all_log_paths = build_log_options(primary_log_path, discovered_log_paths)
+
+    if log_path == LOAD_ALL_OPTION:
+        render_all_logs_dashboard(all_log_paths)
+        return
 
     st.write(f"目标日志文件: {log_path}")
     if not os.path.exists(log_path):
@@ -341,30 +484,8 @@ def main() -> None:
     if skipped_lines > 0:
         st.warning(f"检测到 {skipped_lines} 行损坏或不合法 JSON，已自动跳过。")
 
-    if not df.empty:
-        col1, col2, col3 = st.columns(3)
-        col1.metric("日志条数", f"{len(df)}")
-        col2.metric("最新 kimg", f"{df['kimg'].iloc[-1]:.3f}")
-        col3.metric("可用指标数", f"{sum(metric in df.columns for metric in ALL_METRICS)}")
-
-    overview_tab, g_tab, d_tab, penalty_tab, lr_tab = st.tabs(
-        ["综合主控台 (Overview)", "生成器视图 (G-View)", "判别器视图 (D-View)", "约束惩罚视图 (Penalty-View)", "学习率监控 (LR-View)"]
-    )
-
-    with overview_tab:
-        render_overview_tab(df)
-
-    with g_tab:
-        render_metric_tab(df, ["loss_G", "loss_gan_G", "loss_gan_F"], title="G-View: Generator Metrics vs kimg")
-
-    with d_tab:
-        render_metric_tab(df, ["loss_D", "loss_D_A", "loss_D_B"], title="D-View: Discriminator Metrics vs kimg")
-
-    with penalty_tab:
-        render_metric_tab(df, ["loss_cyc", "loss_id"], title="Penalty-View: Constraint Metrics vs kimg")
-
-    with lr_tab:
-        render_metric_tab(df, ["lr_G", "lr_D"], title="LR-View: Learning Rate vs kimg")
+    render_summary_metrics(df)
+    render_single_log_dashboard(df)
 
 
 if __name__ == "__main__":

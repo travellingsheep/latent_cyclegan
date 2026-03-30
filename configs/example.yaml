@@ -1,7 +1,7 @@
 # Latent CycleGAN config (SD1.5 VAE latent .pt)
 
 # Ablation sweep root directory. run_sweep.py will overwrite this field in each snapshot.
-exp_root: "/home/winchester/latent_cyclegan_outputs/v1.2-batch_size"
+exp_root: "/home/winchester/latent_cyclegan_outputs/v1.3-spectral_norm"
 
 shared:
   # 本地 VAE 根路径。常见情况下可指向 Hugging Face 缓存中的整个模型目录，
@@ -43,6 +43,7 @@ model:
   ndf: 64
   n_res_blocks: 9
   d_layers: 3
+  use_discriminator_sn: true  # 是否对判别器卷积层启用 spectral normalization
   # For latents, default is unconstrained output
   out_activation: "none"  # one of: none, tanh
   use_global_residual: false  # 是否在生成器输出端添加全局残差 x + net(x)

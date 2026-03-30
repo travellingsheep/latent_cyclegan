@@ -10,8 +10,8 @@ from typing import Any, Dict, List, TextIO
 import yaml
 
 
-# 固定的扫描列表，用于 batch size 消融实验。
-SWEEP_BATCH_SIZES = [1, 2, 4, 8, 16]
+# 固定的扫描列表，用于判别器谱归一化消融实验。
+SWEEP_DISCRIMINATOR_SN = [True, False]
 
 
 def now_str() -> str:
@@ -31,7 +31,7 @@ def sweep_log(message: str, flush: bool = True) -> None:
 
 def parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
-    parser = argparse.ArgumentParser(description="CycleGAN batch size 消融实验扫描脚本")
+    parser = argparse.ArgumentParser(description="CycleGAN 判别器谱归一化消融实验扫描脚本")
     parser.add_argument(
         "--config",
         type=str,
@@ -123,13 +123,14 @@ def make_experiment_config(
     base_config_path: str,
     exp_root: str,
     exp_name: str,
-    batch_size: int,
+    use_discriminator_sn: bool,
 ) -> Dict[str, Any]:
     """基于基础配置生成单次实验的配置快照。"""
     exp_dir = os.path.join(exp_root, exp_name)
 
     data_cfg = ensure_mapping(base_config, "data")
     shared_cfg = ensure_mapping(base_config, "shared")
+    model_cfg = ensure_mapping(base_config, "model")
     train_cfg = ensure_mapping(base_config, "train")
     logging_cfg = ensure_mapping(base_config, "logging")
     vis_cfg = ensure_mapping(base_config, "visualization")
@@ -143,7 +144,7 @@ def make_experiment_config(
         shared_cfg["vae_model_name_or_path"] = resolve_model_name_or_path(
             base_config_path, shared_cfg["vae_model_name_or_path"]
         )
-    train_cfg["batch_size"] = int(batch_size)
+    model_cfg["use_discriminator_sn"] = bool(use_discriminator_sn)
     train_cfg["checkpoint_dir"] = os.path.join(exp_dir, "model")
     logging_cfg["log_dir"] = os.path.join(exp_dir, "logs")
     vis_cfg["out_dir"] = os.path.join(exp_dir, "vis")
@@ -208,7 +209,7 @@ def write_summary_csv(summary_path: str, results: List[Dict[str, Any]]) -> None:
     """将当前 sweep 汇总结果写入 CSV，便于后续统计与追踪。"""
     fieldnames = [
         "experiment_name",
-        "batch_size",
+        "use_discriminator_sn",
         "status",
         "return_code",
         "duration_sec",
@@ -261,7 +262,7 @@ def print_summary_table(results: List[Dict[str, Any]]) -> None:
 
 
 def main() -> None:
-    """按预定义 batch size 列表循环执行消融实验。"""
+    """按预定义 SN 开关列表循环执行消融实验。"""
     args = parse_args()
     repo_root = get_repo_root()
     base_config_path = os.path.abspath(args.config if args.config else get_base_config_path(repo_root))
@@ -281,14 +282,16 @@ def main() -> None:
     sweep_log(f"Experiment root: {exp_root}")
     sweep_log(f"Dry-run mode: {args.dry_run}")
 
-    for batch_size in SWEEP_BATCH_SIZES:
-        exp_name = f"batch_size_{batch_size}"
+    for use_discriminator_sn in SWEEP_DISCRIMINATOR_SN:
+        exp_name = "discriminator_sn_on" if use_discriminator_sn else "discriminator_sn_off"
         exp_dir = os.path.join(exp_root, exp_name)
         os.makedirs(exp_dir, exist_ok=True)
 
         print()
         sweep_log("=" * 100)
-        sweep_log(f"Starting sweep run for {exp_name} (batch_size={batch_size})")
+        sweep_log(
+            f"Starting sweep run for {exp_name} (use_discriminator_sn={use_discriminator_sn})"
+        )
         sweep_log(f"Experiment directory: {os.path.abspath(exp_dir)}")
         sweep_log("=" * 100)
 
@@ -303,7 +306,7 @@ def main() -> None:
                 base_config_path=base_config_path,
                 exp_root=exp_root,
                 exp_name=exp_name,
-                batch_size=batch_size,
+                use_discriminator_sn=use_discriminator_sn,
             )
             dump_yaml_config(snapshot_path, run_config)
 
@@ -334,7 +337,7 @@ def main() -> None:
             results.append(
                 {
                     "experiment_name": exp_name,
-                    "batch_size": batch_size,
+                    "use_discriminator_sn": use_discriminator_sn,
                     "status": status,
                     "return_code": return_code,
                     "duration_sec": round(duration_sec, 2),
@@ -352,7 +355,7 @@ def main() -> None:
             results.append(
                 {
                     "experiment_name": exp_name,
-                    "batch_size": batch_size,
+                    "use_discriminator_sn": use_discriminator_sn,
                     "status": "CRASHED",
                     "return_code": -1,
                     "duration_sec": round(duration_sec, 2),

@@ -191,23 +191,43 @@ def load_checkpoint(
         except Exception:
             pass
 
-        # Backward-compat for older PatchDiscriminator:
-        # - removed InstanceNorm layer
-        # - applied spectral_norm to Conv2d, so weights moved to *.weight_orig
+        # Compatibility across historical discriminator variants:
+        # - older layouts used net.5 for the last conv
+        # - spectral_norm moves Conv2d weights from *.weight to *.weight_orig
         mapped: Dict[str, Any] = {}
+        target_state = module.state_dict()
 
         def _map_conv(old_prefix: str, new_prefix: str) -> None:
-            w_key = f"{old_prefix}.weight"
-            b_key = f"{old_prefix}.bias"
-            if w_key in sd:
-                mapped[f"{new_prefix}.weight_orig"] = sd[w_key]
-            if b_key in sd:
-                mapped[f"{new_prefix}.bias"] = sd[b_key]
+            weight_key = ""
+            for candidate in (f"{old_prefix}.weight_orig", f"{old_prefix}.weight"):
+                if candidate in sd:
+                    weight_key = candidate
+                    break
+            if not weight_key:
+                return
+
+            target_weight_key = f"{new_prefix}.weight"
+            if f"{new_prefix}.weight_orig" in target_state:
+                target_weight_key = f"{new_prefix}.weight_orig"
+            mapped[target_weight_key] = sd[weight_key]
+
+            bias_key = f"{old_prefix}.bias"
+            if bias_key in sd and f"{new_prefix}.bias" in target_state:
+                mapped[f"{new_prefix}.bias"] = sd[bias_key]
+
+            for aux_name in ("weight_u", "weight_v"):
+                src_key = f"{old_prefix}.{aux_name}"
+                dst_key = f"{new_prefix}.{aux_name}"
+                if src_key in sd and dst_key in target_state:
+                    mapped[dst_key] = sd[src_key]
 
         _map_conv("net.0", "net.0")
         _map_conv("net.2", "net.2")
-        # old last conv was net.5; new last conv is net.4
+        _map_conv("net.4", "net.4")
         _map_conv("net.5", "net.4")
+
+        if not mapped:
+            raise RuntimeError(f"Failed to compat-load discriminator '{name}' from checkpoint")
 
         missing, unexpected = module.load_state_dict(mapped, strict=False)
         if missing or unexpected:
@@ -491,19 +511,21 @@ class ResnetGenerator(nn.Module):
 
 
 class PatchDiscriminator(nn.Module):
-    def __init__(self, in_ch: int = 4, ndf: int = 32, n_layers: int = 3):
+    def __init__(self, in_ch: int = 4, ndf: int = 32, n_layers: int = 3, use_spectral_norm: bool = True):
         super().__init__()
         _ = n_layers  # kept for backward-compatible constructor/config usage
 
-        from torch.nn.utils import spectral_norm
+        def maybe_sn(layer: nn.Module) -> nn.Module:
+            if not use_spectral_norm:
+                return layer
+            from torch.nn.utils import spectral_norm
 
-        def sn(layer: nn.Module) -> nn.Module:
             return spectral_norm(layer)
 
         seq: List[nn.Module] = [
-            sn(nn.Conv2d(in_ch, ndf, kernel_size=4, stride=2, padding=1)),
+            maybe_sn(nn.Conv2d(in_ch, ndf, kernel_size=4, stride=2, padding=1)),
             nn.LeakyReLU(0.2, inplace=True),
-            sn(
+            maybe_sn(
                 nn.Conv2d(
                 ndf,
                 ndf * 2,
@@ -514,7 +536,7 @@ class PatchDiscriminator(nn.Module):
                 )
             ),
             nn.LeakyReLU(0.2, inplace=True),
-            sn(nn.Conv2d(ndf * 2, 1, kernel_size=3, stride=1, padding=1)),
+            maybe_sn(nn.Conv2d(ndf * 2, 1, kernel_size=3, stride=1, padding=1)),
         ]
 
         self.net = nn.Sequential(*seq)
@@ -758,6 +780,7 @@ def train(cfg: Dict[str, Any]) -> None:
     ndf = int(model_cfg.get("ndf", 32))
     n_res_blocks = int(model_cfg.get("n_res_blocks", 6))
     d_layers = int(model_cfg.get("d_layers", 3))
+    use_discriminator_sn = bool(model_cfg.get("use_discriminator_sn", True))
     out_activation = str(model_cfg.get("out_activation", "none"))
     use_global_residual = bool(model_cfg.get("use_global_residual", False))
     use_pointwise_only = bool(model_cfg.get("use_pointwise_only", False))
@@ -780,8 +803,18 @@ def train(cfg: Dict[str, Any]) -> None:
         use_global_residual=use_global_residual,
         use_pointwise_only=use_pointwise_only,
     ).to(device)
-    D_A = PatchDiscriminator(in_ch=in_ch, ndf=ndf, n_layers=d_layers).to(device)
-    D_B = PatchDiscriminator(in_ch=in_ch, ndf=ndf, n_layers=d_layers).to(device)
+    D_A = PatchDiscriminator(
+        in_ch=in_ch,
+        ndf=ndf,
+        n_layers=d_layers,
+        use_spectral_norm=use_discriminator_sn,
+    ).to(device)
+    D_B = PatchDiscriminator(
+        in_ch=in_ch,
+        ndf=ndf,
+        n_layers=d_layers,
+        use_spectral_norm=use_discriminator_sn,
+    ).to(device)
 
     criterion_gan = nn.MSELoss()
     criterion_cyc = nn.L1Loss()
