@@ -20,12 +20,13 @@
 
 主要配置文件是 [configs/example.yaml](configs/example.yaml)。常用字段如下：
 
-- `exp_root`：消融实验输出根目录，供 [run_sweep.py](run_sweep.py) 使用。
-- `data.a_dir` / `data.b_dir`：两域 latent `.pt` 数据目录。
+- `exp_root`：实验输出根目录。单次训练/评估默认会写到 `exp_root/model`、`exp_root/logs`、`exp_root/vis`、`exp_root/eval`；`run_sweep.py` 还会在它下面继续创建各实验子目录。
+- `style_a` / `style_b`：全局定义实验使用的两个风格名，训练与评估默认都会继承它们。
+- `data.path`：训练 latent 数据根目录；脚本会自动读取 `{path}/{style_a}` 与 `{path}/{style_b}`。
 - `data.max_samples_a` / `data.max_samples_b`：few-shot 截断开关，`-1` 表示使用全部样本。
 - `train.total_kimg`：总训练量，单位为千张图。
-- `logging.log_dir` / `logging.log_file`：训练日志输出位置。
-- `visualization.out_dir`：训练可视化图片输出位置。
+- `logging.use_tqdm`：是否显示长进度条；默认关闭，单跑日志会和 sweep 对齐。
+- `logging.log_file`：训练 JSONL 日志文件名，目录默认是 `exp_root/logs`。
 
 ## 数据格式
 
@@ -45,6 +46,12 @@
 
 ```bash
 /home/winchester/miniconda3/envs/latent_cyclegan/bin/python train_latent_cyclegan.py --config configs/example.yaml
+```
+
+训练 dry-run：
+
+```bash
+/home/winchester/miniconda3/envs/latent_cyclegan/bin/python train_latent_cyclegan.py --config configs/example.yaml --dry-run
 ```
 
 训练日志看板：
@@ -71,8 +78,15 @@
 /home/winchester/miniconda3/envs/latent_cyclegan/bin/python utils/eval_latent_cyclegan.py --config configs/example.yaml
 ```
 
+评估 dry-run：
+
+```bash
+/home/winchester/miniconda3/envs/latent_cyclegan/bin/python eval/evaluate_latent.py --config configs/example.yaml --dry-run
+```
+
 ## 输出位置
 
-- 单次训练输出由 `train.checkpoint_dir`、`logging.log_dir`、`visualization.out_dir` 控制。
-- sweep 输出会写入 `exp_root/run_all`、`exp_root/run_3000` 等目录。
+- 单次训练默认输出到 `exp_root/model`、`exp_root/logs`、`exp_root/vis`。
+- 单次评估默认输出到 `exp_root/eval`，同时会在该目录下生成 `metrics.csv` 与 `metrics_report.json`。
+- sweep 输出会写入 `exp_root/<run_name>` 子目录。
 - sweep 汇总表会保存为 `exp_root/sweep_summary.csv`。

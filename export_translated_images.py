@@ -15,6 +15,8 @@ from train_latent_cyclegan import (
     decode_latents_to_images,
     load_latent_tensor,
     load_yaml_config,
+    resolve_domain_dir,
+    resolve_style_pair,
     resolve_vae_source,
 )
 
@@ -79,12 +81,6 @@ def _pick_state_dict(payload: Dict[str, Any], keys: Sequence[str]) -> Optional[D
         if _is_state_dict(value):
             return value
     return None
-
-
-def _resolve_domain_dir(base_dir: Path, domain_name: str, key_name: str) -> Path:
-    path = base_dir / domain_name
-    _require(path.exists(), f"{key_name} not found for domain '{domain_name}': {path}")
-    return path
 
 
 def _list_latents(root: Path) -> List[Path]:
@@ -194,8 +190,11 @@ def _phase0_parse_config(args: argparse.Namespace) -> ExportConfig:
     _require(isinstance(export_cfg, dict), "config.image_export must be a dict")
     _require(isinstance(eval_cfg, dict), "config.cyclegan_eval must be a dict")
 
-    domain_A_name = str(export_cfg.get("domain_A_name", eval_cfg.get("domain_A_name", "")) or "").strip()
-    domain_B_name = str(export_cfg.get("domain_B_name", eval_cfg.get("domain_B_name", "")) or "").strip()
+    domain_A_name, domain_B_name = resolve_style_pair(
+        cfg,
+        fallback_a=export_cfg.get("domain_A_name", eval_cfg.get("domain_A_name", "")),
+        fallback_b=export_cfg.get("domain_B_name", eval_cfg.get("domain_B_name", "")),
+    )
     base_latent_dir = Path(args.base_latent_dir or export_cfg.get("base_latent_dir", eval_cfg.get("base_latent_dir", "")) or "")
     base_orig_rgb_dir = Path(export_cfg.get("base_orig_rgb_dir", eval_cfg.get("base_orig_rgb_dir", "")) or "")
     base_vae_recon_dir = Path(export_cfg.get("base_vae_recon_dir", eval_cfg.get("base_vae_recon_dir", "")) or "")
@@ -212,8 +211,8 @@ def _phase0_parse_config(args: argparse.Namespace) -> ExportConfig:
         args.use_bf16_autocast if args.use_bf16_autocast is not None else export_cfg.get("use_bf16_autocast", True)
     )
 
-    _require(domain_A_name, "image_export.domain_A_name is required")
-    _require(domain_B_name, "image_export.domain_B_name is required")
+    _require(domain_A_name, "config.style_a or image_export.domain_A_name is required")
+    _require(domain_B_name, "config.style_b or image_export.domain_B_name is required")
     _require(str(base_latent_dir), "image_export.base_latent_dir is required")
     _require(str(base_orig_rgb_dir), "image_export.base_orig_rgb_dir or cyclegan_eval.base_orig_rgb_dir is required")
     _require(str(base_vae_recon_dir), "image_export.base_vae_recon_dir or cyclegan_eval.base_vae_recon_dir is required")
@@ -224,12 +223,12 @@ def _phase0_parse_config(args: argparse.Namespace) -> ExportConfig:
     _require(base_orig_rgb_dir.exists(), f"base_orig_rgb_dir not found: {base_orig_rgb_dir}")
     _require(base_vae_recon_dir.exists(), f"base_vae_recon_dir not found: {base_vae_recon_dir}")
 
-    _resolve_domain_dir(base_latent_dir, domain_A_name, "base_latent_dir")
-    _resolve_domain_dir(base_latent_dir, domain_B_name, "base_latent_dir")
-    _resolve_domain_dir(base_orig_rgb_dir, domain_A_name, "base_orig_rgb_dir")
-    _resolve_domain_dir(base_orig_rgb_dir, domain_B_name, "base_orig_rgb_dir")
-    _resolve_domain_dir(base_vae_recon_dir, domain_A_name, "base_vae_recon_dir")
-    _resolve_domain_dir(base_vae_recon_dir, domain_B_name, "base_vae_recon_dir")
+    resolve_domain_dir(base_latent_dir, domain_A_name, "base_latent_dir")
+    resolve_domain_dir(base_latent_dir, domain_B_name, "base_latent_dir")
+    resolve_domain_dir(base_orig_rgb_dir, domain_A_name, "base_orig_rgb_dir")
+    resolve_domain_dir(base_orig_rgb_dir, domain_B_name, "base_orig_rgb_dir")
+    resolve_domain_dir(base_vae_recon_dir, domain_A_name, "base_vae_recon_dir")
+    resolve_domain_dir(base_vae_recon_dir, domain_B_name, "base_vae_recon_dir")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     return ExportConfig(
@@ -255,9 +254,9 @@ def _phase0_parse_config(args: argparse.Namespace) -> ExportConfig:
 
 def _build_directions(ecfg: ExportConfig) -> List[ExportDirection]:
     def _mk(name: str, src_domain: str, tgt_domain: str) -> ExportDirection:
-        src_dir = _resolve_domain_dir(ecfg.base_latent_dir, src_domain, "base_latent_dir")
-        orig_rgb_dir = _resolve_domain_dir(ecfg.base_orig_rgb_dir, src_domain, "base_orig_rgb_dir")
-        vae_recon_dir = _resolve_domain_dir(ecfg.base_vae_recon_dir, src_domain, "base_vae_recon_dir")
+        src_dir = resolve_domain_dir(ecfg.base_latent_dir, src_domain, "base_latent_dir")
+        orig_rgb_dir = resolve_domain_dir(ecfg.base_orig_rgb_dir, src_domain, "base_orig_rgb_dir")
+        vae_recon_dir = resolve_domain_dir(ecfg.base_vae_recon_dir, src_domain, "base_vae_recon_dir")
         out_dir = ecfg.output_dir / name
         out_dir.mkdir(parents=True, exist_ok=True)
         return ExportDirection(

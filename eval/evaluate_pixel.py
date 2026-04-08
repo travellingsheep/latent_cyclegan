@@ -25,7 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from train_latent_cyclegan import load_yaml_config  # noqa: E402
+from train_latent_cyclegan import load_yaml_config, resolve_domain_dir, resolve_experiment_root, resolve_style_pair  # noqa: E402
 
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
@@ -291,12 +291,6 @@ def _build_stem_index(root: Path) -> Dict[str, Path]:
     return index
 
 
-def _resolve_domain_dir(base_dir: Path, domain_name: str, key_name: str) -> Path:
-    path = base_dir / domain_name
-    _require(path.exists(), f"{key_name} not found for domain '{domain_name}': {path}")
-    return path
-
-
 def _select_image_paths(
     image_paths: Sequence[Path],
     max_eval_samples: int,
@@ -545,14 +539,19 @@ def _phase0_parse_config(args: argparse.Namespace) -> EvalConfig:
     _require(isinstance(shared_cfg, dict), "config.shared must be a dict")
     _require(isinstance(eval_cfg, dict), "config.pixel_cyclegan_eval must be a dict")
 
-    domain_A_name = str(eval_cfg.get("domain_A_name", "") or "").strip()
-    domain_B_name = str(eval_cfg.get("domain_B_name", "") or "").strip()
+    domain_A_name, domain_B_name = resolve_style_pair(
+        cfg,
+        fallback_a=eval_cfg.get("domain_A_name", ""),
+        fallback_b=eval_cfg.get("domain_B_name", ""),
+    )
     direction_mode = str(eval_cfg.get("direction_mode", "both") or "both").strip().lower()
     single_direction = str(eval_cfg.get("single_direction", "A2B") or "A2B").strip().upper()
 
+    exp_root = resolve_experiment_root(cfg, str(config_path))
     base_test_image_dir = _resolve_repo_path(args.base_test_image_dir or eval_cfg.get("base_test_image_dir", "") or "")
     base_ref_image_dir = _resolve_repo_path(args.base_ref_image_dir or eval_cfg.get("base_ref_image_dir", "") or "")
-    eval_output_dir = _resolve_repo_path(args.eval_output_dir or eval_cfg.get("eval_output_dir", "outputs/eval_pixel_cyclegan"))
+    default_eval_output_dir = exp_root / "eval" if str(exp_root) else Path("outputs/eval_pixel_cyclegan")
+    eval_output_dir = _resolve_repo_path(args.eval_output_dir or eval_cfg.get("eval_output_dir", "") or default_eval_output_dir)
     reference_cache_dir = _resolve_repo_path(
         args.reference_cache_dir or eval_cfg.get("reference_cache_dir", "outputs/eval_cache_pixel_cyclegan")
     )
@@ -572,8 +571,8 @@ def _phase0_parse_config(args: argparse.Namespace) -> EvalConfig:
     max_eval_samples = int(eval_cfg.get("max_eval_samples", -1))
     eval_seed = int(eval_cfg.get("eval_seed", 42))
 
-    _require(domain_A_name, "pixel_cyclegan_eval.domain_A_name is required")
-    _require(domain_B_name, "pixel_cyclegan_eval.domain_B_name is required")
+    _require(domain_A_name, "config.style_a or pixel_cyclegan_eval.domain_A_name is required")
+    _require(domain_B_name, "config.style_b or pixel_cyclegan_eval.domain_B_name is required")
     _require(direction_mode in {"single", "both"}, "pixel_cyclegan_eval.direction_mode must be 'single' or 'both'")
     _require(single_direction in {"A2B", "B2A"}, "pixel_cyclegan_eval.single_direction must be 'A2B' or 'B2A'")
     _require(str(base_test_image_dir), "pixel_cyclegan_eval.base_test_image_dir is required")
@@ -582,13 +581,14 @@ def _phase0_parse_config(args: argparse.Namespace) -> EvalConfig:
 
     _require(base_test_image_dir.exists(), f"base_test_image_dir not found: {base_test_image_dir}")
     _require(base_ref_image_dir.exists(), f"base_ref_image_dir not found: {base_ref_image_dir}")
-    _resolve_domain_dir(base_test_image_dir, domain_A_name, "base_test_image_dir")
-    _resolve_domain_dir(base_test_image_dir, domain_B_name, "base_test_image_dir")
-    _resolve_domain_dir(base_ref_image_dir, domain_A_name, "base_ref_image_dir")
-    _resolve_domain_dir(base_ref_image_dir, domain_B_name, "base_ref_image_dir")
+    resolve_domain_dir(base_test_image_dir, domain_A_name, "base_test_image_dir")
+    resolve_domain_dir(base_test_image_dir, domain_B_name, "base_test_image_dir")
+    resolve_domain_dir(base_ref_image_dir, domain_A_name, "base_ref_image_dir")
+    resolve_domain_dir(base_ref_image_dir, domain_B_name, "base_ref_image_dir")
 
-    eval_output_dir.mkdir(parents=True, exist_ok=True)
-    reference_cache_dir.mkdir(parents=True, exist_ok=True)
+    if not bool(getattr(args, "dry_run", False)):
+        eval_output_dir.mkdir(parents=True, exist_ok=True)
+        reference_cache_dir.mkdir(parents=True, exist_ok=True)
 
     return EvalConfig(
         shared_cfg=shared_cfg,
@@ -1089,6 +1089,32 @@ def _write_reports(direction: EvalDirection, metric_payload: Dict[str, Any]) -> 
     _log(f"[{direction.name}][Phase3] Saved CSV report to: {report_csv}")
 
 
+def _write_global_summary(eval_output_dir: Path, payloads: Dict[str, Dict[str, Any]]) -> None:
+    report_json = eval_output_dir / "metrics_report.json"
+    report_csv = eval_output_dir / "metrics.csv"
+
+    summary_payload = {name: payload["summary"] for name, payload in payloads.items()}
+    with open(report_json, "w", encoding="utf-8") as f:
+        json.dump(summary_payload, f, indent=2, ensure_ascii=False)
+
+    rows: List[Dict[str, Any]] = []
+    for direction_name, payload in payloads.items():
+        row = {"direction": direction_name}
+        row.update(payload["summary"])
+        rows.append(row)
+
+    if rows:
+        fields = ["direction"] + sorted({key for row in rows for key in row.keys() if key != "direction"})
+        with open(report_csv, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({k: row.get(k) for k in fields})
+
+    _log(f"[Done] Saved global JSON report to: {report_json}")
+    _log(f"[Done] Saved global CSV report to: {report_csv}")
+
+
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Standard pixel-space CycleGAN evaluation")
     p.add_argument("--config", type=str, default="configs/example.yaml")
@@ -1103,15 +1129,17 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--use_bf16_autocast", action="store_true", default=None)
     p.add_argument("--no_use_bf16_autocast", dest="use_bf16_autocast", action="store_false")
     p.add_argument("--force_regen_cache", action="store_true")
+    p.add_argument("--dry-run", action="store_true", help="Resolve config and planned outputs without evaluation")
     return p
 
 
-def _build_directions(ecfg: EvalConfig) -> List[EvalDirection]:
+def _build_directions(ecfg: EvalConfig, create_dirs: bool = True) -> List[EvalDirection]:
     def _mk(name: str, src_domain: str, tgt_domain: str) -> EvalDirection:
-        test_image_dir = _resolve_domain_dir(ecfg.base_test_image_dir, src_domain, "base_test_image_dir")
-        tgt_ref_dir = _resolve_domain_dir(ecfg.base_ref_image_dir, tgt_domain, "base_ref_image_dir")
+        test_image_dir = resolve_domain_dir(ecfg.base_test_image_dir, src_domain, "base_test_image_dir")
+        tgt_ref_dir = resolve_domain_dir(ecfg.base_ref_image_dir, tgt_domain, "base_ref_image_dir")
         out_dir = ecfg.eval_output_dir / name
-        out_dir.mkdir(parents=True, exist_ok=True)
+        if create_dirs:
+            out_dir.mkdir(parents=True, exist_ok=True)
         return EvalDirection(
             name=name,
             src_domain=src_domain,
@@ -1135,7 +1163,23 @@ def main() -> None:
 
     _log("[Phase0] Parsing YAML and applying CLI overrides...")
     ecfg = _phase0_parse_config(args)
-    directions = _build_directions(ecfg)
+    directions = _build_directions(ecfg, create_dirs=not args.dry_run)
+    if args.dry_run:
+        _log("[DRY-RUN] Pixel eval config resolved.")
+        _log(f"  config={Path(args.config).expanduser().resolve()}")
+        _log(f"  checkpoint={ecfg.generator_checkpoint_path}")
+        _log(f"  eval_output_dir={ecfg.eval_output_dir}")
+        _log(f"  reference_cache_dir={ecfg.reference_cache_dir}")
+        for direction in directions:
+            _log(f"  [{direction.name}] src={direction.src_domain} tgt={direction.tgt_domain}")
+            _log(f"    test_image_dir={direction.test_image_dir}")
+            _log(f"    tgt_ref_dir={direction.tgt_ref_dir}")
+            _log(f"    planned_dir={direction.out_dir}")
+            _log(f"    planned_file={direction.out_dir / ('eval_metrics_' + direction.name + '.json')}")
+            _log(f"    planned_file={direction.out_dir / ('eval_metrics_' + direction.name + '.csv')}")
+        _log(f"  planned_global_json={ecfg.eval_output_dir / 'metrics_report.json'}")
+        _log(f"  planned_global_csv={ecfg.eval_output_dir / 'metrics.csv'}")
+        return
 
     _log("[Setup] Loading requested generator(s) from checkpoint...")
     generators = _load_generators(ecfg, directions)
@@ -1150,6 +1194,7 @@ def main() -> None:
             "clip_processor": clip_processor,
         }
 
+    all_metric_payloads: Dict[str, Dict[str, Any]] = {}
     for direction in directions:
         generator = generators.get(direction.name)
         if generator is None:
@@ -1184,6 +1229,9 @@ def main() -> None:
             phase2_outputs=phase2_outputs,
         )
         _write_reports(direction=direction, metric_payload=metric_payload)
+        all_metric_payloads[direction.name] = metric_payload
+
+    _write_global_summary(ecfg.eval_output_dir, all_metric_payloads)
 
 
 if __name__ == "__main__":

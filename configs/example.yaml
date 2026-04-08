@@ -1,7 +1,9 @@
 # Latent CycleGAN config (SD1.5 VAE latent .pt)
 
 # Ablation sweep root directory. run_sweep.py will overwrite this field in each snapshot.
-exp_root: "/home/winchester/latent_cyclegan_outputs/v1.3-spectral_norm"
+exp_root: "/home/winchester/projects/latent_cyclegan_outputs/hayao2photo/v1.0-baseline_use_residual_use_sn_full_dataset_bs_1"
+style_a: "Hayao"
+style_b: "photo"
 
 shared:
   # 本地 VAE 根路径。常见情况下可指向 Hugging Face 缓存中的整个模型目录，
@@ -16,9 +18,8 @@ shared:
   cleanfid_inception_path: "/tmp/inception-2015-12-05.pt"
 
 data:
-  # Two unpaired domains (each contains many .pt)
-  a_dir: "/home/winchester/projects/datasets/pt_datasets/unscaled_dataset/monet"
-  b_dir: "/home/winchester/projects/datasets/pt_datasets/unscaled_dataset/photo"
+  # 训练 latent 根目录；脚本会自动读取 {path}/{style_a} 与 {path}/{style_b}
+  path: "/home/winchester/projects/latent_style_transfer/datasets/pt_datasets/unscaled_dataset"
 
   # IMPORTANT: your .pt latents are NOT scaled by 0.18215
   # - If False: decode uses latents directly (recommended for your case)
@@ -46,13 +47,13 @@ model:
   use_discriminator_sn: true  # 是否对判别器卷积层启用 spectral normalization
   # For latents, default is unconstrained output
   out_activation: "none"  # one of: none, tanh
-  use_global_residual: false  # 是否在生成器输出端添加全局残差 x + net(x)
+  use_global_residual: true  # 是否在生成器输出端添加全局残差 x + net(x)
   use_pointwise_only: false   # 是否将生成器中所有卷积替换为 1x1 卷积并移除 Padding
 
 train:
   device: "cuda"   # "cuda" or "cpu"
   seed: 42
-  batch_size: 4
+  batch_size: 1
   total_kimg: 214
   num_workers: 4
   amp: true
@@ -61,8 +62,7 @@ train:
   ckpt_every_kimg: 20
   vis_every_kimg: 20
 
-  # Checkpoints
-  checkpoint_dir: "/home/winchester/latent_cyclegan_outputs/model"
+  # Checkpoints: 留空时默认写入 {exp_root}/model
   resume: true
   # If empty, will try {checkpoint_dir}/last.pt
   resume_path: ""
@@ -92,15 +92,20 @@ train:
   lambda_id: 0.1
 
 logging:
+  # 默认关闭 tqdm，单跑时输出模式与 sweep 保持一致。
+  use_tqdm: false
   # tqdm fixed width; bar length is fixed via bar_format
   tqdm_ncols: 120
   tqdm_bar_len: 30
 
-  log_dir: "/home/winchester/latent_cyclegan_outputs/logs"
   log_file: "train_log.jsonl"
 
 visualization:
-  out_dir: "/home/winchester/latent_cyclegan_outputs/vis"
+  # visualize_logs.py 使用的实验扫描根目录。
+  # 页面会读取该路径下的所有一级子文件夹，并把它们视为可选实验目录。
+  # 留空时会回退到顶层 exp_root。
+  scan_root: "/home/winchester/projects/latent_cyclegan_outputs"
+
   num_samples: 2
 
   # VAE for decoding latents -> RGB (for visualization only)
@@ -113,23 +118,21 @@ visualization:
 
 # Batch export config for export_translated_images.py
 image_export:
-  # 域定义：默认继承自 cyclegan_eval.domain_A_name / domain_B_name
-  domain_A_name: "monet"
-  domain_B_name: "photo"
+  # 域定义：默认继承自全局 style_a / style_b
 
   # latent 根目录：默认继承自 cyclegan_eval.base_latent_dir
-  base_latent_dir: "/home/winchester/projects/datasets/pt_datasets/unscaled_test_dataset"
+  base_latent_dir: "/home/winchester/projects/latent_style_transfer/datasets/pt_datasets/unscaled_test_dataset"
 
   # 三联图所需原图与 VAE 重建图目录：默认继承自 cyclegan_eval 对应字段
-  base_orig_rgb_dir: "/home/winchester/projects/datasets/test_image_datasets"
-  base_vae_recon_dir: "/home/winchester/projects/datasets/reconstructed_images"
+  base_orig_rgb_dir: "/home/winchester/projects/latent_style_transfer/datasets/test_image_datasets"
+  base_vae_recon_dir: "/home/winchester/projects/latent_style_transfer/datasets/reconstructed_images"
 
   # 模型 checkpoint 路径：支持完整训练 checkpoint，或只包含网络权重的 extracted_model.pt
-  model_path: "/home/winchester/latent_cyclegan_outputs/run_10/model/extracted_model.pt"
+  model_path: "/home/winchester/projects/latent_cyclegan_outputs/run_10/model/extracted_model.pt"
 
   # 导出图片根目录：输出结构为 {output_dir}/A2B/*.png 和 {output_dir}/B2A/*.png
   # 每张图都是 [原图 | 重建图 | 风格迁移图] 三联图
-  output_dir: "/home/winchester/latent_cyclegan_outputs/run_10/exported_images"
+  output_dir: "/home/winchester/projects/latent_cyclegan_outputs/run_10/exported_images"
 
   # 三联图中每个 panel 的显示边长；默认可与 cyclegan_eval.eval_image_size 保持一致
   eval_image_size: 256
@@ -148,28 +151,25 @@ cyclegan_eval:
   # 可选：直接指定某个实验目录。
   # 如果填写，evaluate_latent.py 会自动加载该目录下的 config.yaml，
   # 并默认使用 {experiment_dir}/model/last.pt 与 {experiment_dir}/eval。
-  experiment_dir: "/home/winchester/latent_cyclegan_outputs/v1.2-batch_size"
+  experiment_dir: ""
 
-  # 域定义：脚本会自动构造 A2B / B2A 两个方向
-  domain_A_name: "monet"
-  domain_B_name: "photo"
+  # 域定义：默认继承自全局 style_a / style_b；脚本会自动构造 A2B / B2A 两个方向
 
   # 根目录定义（自动拼接 /{domain_A_name} 与 /{domain_B_name}）
-  base_latent_dir: "/home/winchester/projects/datasets/pt_datasets/unscaled_test_dataset"
-  base_orig_rgb_dir: "/home/winchester/projects/datasets/test_image_datasets"
-  base_vae_recon_dir: "/home/winchester/projects/datasets/reconstructed_images"
+  base_latent_dir: "/home/winchester/projects/latent_style_transfer/datasets/pt_datasets/unscaled_test_dataset"
+  base_orig_rgb_dir: "/home/winchester/projects/latent_style_transfer/datasets/test_image_datasets"
+  base_vae_recon_dir: "/home/winchester/projects/latent_style_transfer/datasets/reconstructed_images"
 
   # 全局生成与评估控制（对每个方向生效）
   # 0 或 -1 表示不限制
   max_eval_samples: 30
   eval_seed: 42
 
-  # eval_output_dir: 评估输出目录；会写入生成图、3-panel、metrics_report.json、metrics.csv。
-  # eval_output_dir: "../latent_cyclegan_outputs/only_residual/eval"
+  # eval_output_dir: 留空时默认写入 {exp_root}/eval；
+  # 如果指定了 experiment_dir，则默认写入 {experiment_dir}/eval。
   # reference_cache_dir: 参考统计缓存目录；用于复用 testB 的 FID/KID/CLIP 特征。
-  reference_cache_dir: "/home/winchester/latent_cyclegan_outputs/eval_cache_cyclegan"
-  # generator_checkpoint_path: 生成器检查点路径；为空时回退到 train.checkpoint_dir/last.pt。
-  # generator_checkpoint_path: "../latent_cyclegan_outputs/only_residual/model/last.pt"
+  reference_cache_dir: "/home/winchester/projects/latent_cyclegan_outputs/eval_cache_cyclegan"
+  # generator_checkpoint_path: 为空时回退到 {exp_root}/model/last.pt
 
   # eval_image_size: 评估时统一 resize 的边长（像素），同时影响缓存键与指标一致性。
   eval_image_size: 256
@@ -205,8 +205,7 @@ cyclegan_eval:
 
 # Evaluation config for evaluate_pixel.py (Standard Pixel-space CycleGAN evaluator)
 pixel_cyclegan_eval:
-  domain_A_name: "monet"
-  domain_B_name: "photo"
+  # 域定义：默认继承自全局 style_a / style_b
 
   # 运行模式控制
   # direction_mode: 可选 "single" 或 "both"
@@ -215,13 +214,13 @@ pixel_cyclegan_eval:
   single_direction: "A2B"
 
   # 数据目录 (完全摒弃 latent 和 vae_recon)
-  base_test_image_dir: "/home/winchester/projects/datasets/test_image_datasets"
-  base_ref_image_dir: "/home/winchester/projects/datasets/test_image_datasets"
+  base_test_image_dir: "/home/winchester/projects/latent_style_transfer/datasets/test_image_datasets"
+  base_ref_image_dir: "/home/winchester/projects/latent_style_transfer/datasets/test_image_datasets"
 
   # 评测输出与模型路径
-  eval_output_dir: "/home/winchester/latent_cyclegan_outputs/eval_pixel_cyclegan"
-  reference_cache_dir: "/home/winchester/latent_cyclegan_outputs/eval_cache_pixel_cyclegan"
-  generator_checkpoint_path: "/home/winchester/projects/cyclegan_origin_repull/pytorch-CycleGAN-and-pix2pix/checkpoints/monet2photo_pretrained/latest_net_G.pth"
+  # eval_output_dir: 留空时默认写入 {exp_root}/eval
+  reference_cache_dir: "/home/winchester/projects/latent_cyclegan_outputs/eval_cache_pixel_cyclegan"
+  generator_checkpoint_path: "/home/winchester/projects/latent_style_transfer/cyclegan_origin_repull/pytorch-CycleGAN-and-pix2pix/checkpoints/monet2photo_pretrained/latest_net_G.pth"
 
   # 采样与硬件配置
   max_eval_samples: 30

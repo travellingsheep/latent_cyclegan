@@ -152,6 +152,7 @@ def write_resolved_eval_config(
         ("exp_root",),
         ("shared", "vae_model_name_or_path"),
         ("shared", "cleanfid_inception_path"),
+        ("data", "path"),
         ("data", "a_dir"),
         ("data", "b_dir"),
         ("train", "checkpoint_dir"),

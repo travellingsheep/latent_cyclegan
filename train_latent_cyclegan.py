@@ -342,6 +342,98 @@ def load_yaml_config(path: str) -> Dict[str, Any]:
     return cfg
 
 
+def resolve_config_path(path_value: Any, config_path: str = "") -> Path:
+    path_str = str(path_value or "").strip()
+    if not path_str:
+        return Path("")
+    raw = Path(path_str).expanduser()
+    if raw.is_absolute():
+        return raw
+    base_dir = Path(config_path).expanduser().resolve().parent if config_path else Path.cwd()
+    return (base_dir / raw).resolve()
+
+
+def resolve_experiment_root(cfg: Dict[str, Any], config_path: str = "") -> Path:
+    exp_root_raw = str(cfg.get("exp_root", "") or "").strip()
+    if exp_root_raw:
+        return resolve_config_path(exp_root_raw, config_path)
+    return Path("")
+
+
+def resolve_style_pair(
+    cfg: Dict[str, Any],
+    fallback_a: Any = "",
+    fallback_b: Any = "",
+) -> Tuple[str, str]:
+    style_a = str(cfg.get("style_a", fallback_a) or "").strip()
+    style_b = str(cfg.get("style_b", fallback_b) or "").strip()
+    return style_a, style_b
+
+
+def resolve_domain_dir(base_dir: Path, domain_name: str, key_name: str) -> Path:
+    path = base_dir / domain_name
+    _require(path.exists(), f"{key_name} not found for domain '{domain_name}': {path}")
+    return path
+
+
+def resolve_data_style_dirs(
+    cfg: Dict[str, Any],
+    config_path: str = "",
+) -> Tuple[str, str, Path, Path]:
+    data_cfg = cfg.get("data", {})
+    _require(isinstance(data_cfg, dict), "config.data must be a dict")
+
+    style_a, style_b = resolve_style_pair(cfg)
+    data_root_raw = data_cfg.get("path", "")
+    data_root = resolve_config_path(data_root_raw, config_path)
+    if str(data_root):
+        _require(style_a, "config.style_a is required when config.data.path is used")
+        _require(style_b, "config.style_b is required when config.data.path is used")
+        _require(data_root.exists(), f"config.data.path not found: {data_root}")
+        a_dir = resolve_domain_dir(data_root, style_a, "config.data.path")
+        b_dir = resolve_domain_dir(data_root, style_b, "config.data.path")
+        return style_a, style_b, a_dir, b_dir
+
+    a_dir_raw = data_cfg.get("a_dir")
+    b_dir_raw = data_cfg.get("b_dir")
+    _require(isinstance(a_dir_raw, str) and a_dir_raw, "config.data.a_dir is required")
+    _require(isinstance(b_dir_raw, str) and b_dir_raw, "config.data.b_dir is required")
+    a_dir = resolve_config_path(a_dir_raw, config_path)
+    b_dir = resolve_config_path(b_dir_raw, config_path)
+    if not style_a:
+        style_a = a_dir.name
+    if not style_b:
+        style_b = b_dir.name
+    return style_a, style_b, a_dir, b_dir
+
+
+def resolve_train_output_paths(cfg: Dict[str, Any], config_path: str = "") -> Dict[str, str]:
+    train_cfg = cfg.get("train", {})
+    log_cfg = cfg.get("logging", {})
+    vis_cfg = cfg.get("visualization", {})
+
+    exp_root = resolve_experiment_root(cfg, config_path)
+    default_log_dir = exp_root / "logs" if str(exp_root) else Path("outputs/logs")
+    default_vis_dir = exp_root / "vis" if str(exp_root) else Path("outputs/vis")
+    default_ckpt_dir = exp_root / "model" if str(exp_root) else Path(_default_checkpoint_dir())
+
+    log_dir = str(resolve_config_path(log_cfg.get("log_dir", default_log_dir), config_path))
+    log_file = str(log_cfg.get("log_file", "train_log.jsonl"))
+    text_log_file = str(log_cfg.get("text_log_file", "train_console.log"))
+    vis_dir = str(resolve_config_path(vis_cfg.get("out_dir", default_vis_dir), config_path))
+    ckpt_dir = str(resolve_config_path(train_cfg.get("checkpoint_dir", default_ckpt_dir), config_path))
+    return {
+        "exp_root": str(exp_root),
+        "log_dir": log_dir,
+        "log_path": os.path.join(log_dir, log_file),
+        "text_log_path": os.path.join(log_dir, text_log_file),
+        "loss_plot_path": os.path.join(log_dir, "loss_curves.png"),
+        "vis_dir": vis_dir,
+        "ckpt_dir": ckpt_dir,
+        "last_ckpt_path": _checkpoint_last_path(ckpt_dir),
+    }
+
+
 def list_pt_files(root: str) -> List[Path]:
     root_path = Path(root)
     if not root_path.exists():
@@ -650,7 +742,7 @@ def _mean(values: List[float]) -> float:
     return float(sum(values) / len(values))
 
 
-def train(cfg: Dict[str, Any]) -> None:
+def train(cfg: Dict[str, Any], config_path: str = "") -> None:
     from tqdm import tqdm  # type: ignore
 
     data_cfg = cfg.get("data", {})
@@ -659,10 +751,9 @@ def train(cfg: Dict[str, Any]) -> None:
     log_cfg = cfg.get("logging", {})
     vis_cfg = cfg.get("visualization", {})
 
-    a_dir = data_cfg.get("a_dir")
-    b_dir = data_cfg.get("b_dir")
-    _require(isinstance(a_dir, str) and a_dir, "config.data.a_dir is required")
-    _require(isinstance(b_dir, str) and b_dir, "config.data.b_dir is required")
+    style_a, style_b, a_dir_path, b_dir_path = resolve_data_style_dirs(cfg, config_path)
+    a_dir = str(a_dir_path)
+    b_dir = str(b_dir_path)
 
     latents_scaled = bool(data_cfg.get("latents_scaled", False))
     latent_divisor = float(data_cfg.get("latent_divisor", 1.0))
@@ -672,6 +763,8 @@ def train(cfg: Dict[str, Any]) -> None:
 
     seed = int(train_cfg.get("seed", 42))
     set_seed(seed)
+    log_message(f"Resolved training styles: A={style_a}, B={style_b}")
+    log_message(f"Resolved training data dirs: A={a_dir}, B={b_dir}")
 
     device_str = train_cfg.get("device", "cuda")
     if device_str == "cuda" and not torch.cuda.is_available():
@@ -715,22 +808,22 @@ def train(cfg: Dict[str, Any]) -> None:
 
     tqdm_ncols = int(log_cfg.get("tqdm_ncols", 120))
     tqdm_bar_len = int(log_cfg.get("tqdm_bar_len", 30))
+    use_tqdm = bool(log_cfg.get("use_tqdm", False))
 
-    log_dir = str(log_cfg.get("log_dir", "outputs/logs"))
-    log_file = str(log_cfg.get("log_file", "train_log.jsonl"))
-    text_log_file = str(log_cfg.get("text_log_file", "train_console.log"))
-    log_path = os.path.join(log_dir, log_file)
-    text_log_path = os.path.join(log_dir, text_log_file)
-    loss_plot_path = os.path.join(log_dir, "loss_curves.png")
+    output_paths = resolve_train_output_paths(cfg, config_path)
+    log_dir = output_paths["log_dir"]
+    log_path = output_paths["log_path"]
+    text_log_path = output_paths["text_log_path"]
+    loss_plot_path = output_paths["loss_plot_path"]
 
     os.makedirs(log_dir, exist_ok=True)
     _set_active_text_log_path(text_log_path)
 
-    vis_dir = str(vis_cfg.get("out_dir", "outputs/vis"))
+    vis_dir = output_paths["vis_dir"]
     vis_num = int(vis_cfg.get("num_samples", 4))
 
     # checkpoint
-    ckpt_dir = str(train_cfg.get("checkpoint_dir", _default_checkpoint_dir()))
+    ckpt_dir = output_paths["ckpt_dir"]
     resume = bool(train_cfg.get("resume", False))
     resume_path = train_cfg.get("resume_path")
     resume_path = str(resume_path) if isinstance(resume_path, str) and resume_path else ""
@@ -902,8 +995,6 @@ def train(cfg: Dict[str, Any]) -> None:
             f"Nothing to do."
         )
         return
-
-    use_tqdm = sys.stderr.isatty()
 
     pbar = tqdm(
         total=total_steps,
@@ -1176,10 +1267,31 @@ def main() -> None:
         default="configs/example.yaml",
         help="Path to YAML config (default: configs/example.yaml)",
     )
+    parser.add_argument("--dry-run", action="store_true", help="Resolve config and planned outputs without training")
     args = parser.parse_args()
 
     cfg = load_yaml_config(args.config)
-    train(cfg)
+    if args.dry_run:
+        style_a, style_b, a_dir_path, b_dir_path = resolve_data_style_dirs(cfg, args.config)
+        outputs = resolve_train_output_paths(cfg, args.config)
+        print("[DRY-RUN] Training config resolved.", flush=True)
+        print(f"  config: {Path(args.config).expanduser().resolve()}", flush=True)
+        print(f"  exp_root: {outputs['exp_root'] or '(not set)'}", flush=True)
+        print(f"  style_a: {style_a}", flush=True)
+        print(f"  style_b: {style_b}", flush=True)
+        print(f"  data_a: {a_dir_path}", flush=True)
+        print(f"  data_b: {b_dir_path}", flush=True)
+        print("  planned outputs:", flush=True)
+        print(f"    - {outputs['ckpt_dir']}/", flush=True)
+        print(f"    - {outputs['last_ckpt_path']}", flush=True)
+        print(f"    - {outputs['log_dir']}/", flush=True)
+        print(f"    - {outputs['log_path']}", flush=True)
+        print(f"    - {outputs['text_log_path']}", flush=True)
+        print(f"    - {outputs['loss_plot_path']}", flush=True)
+        print(f"    - {outputs['vis_dir']}/", flush=True)
+        print("    - {vis_dir}/kimg_*.png".format(vis_dir=outputs["vis_dir"]), flush=True)
+        return
+    train(cfg, config_path=args.config)
 
 
 if __name__ == "__main__":

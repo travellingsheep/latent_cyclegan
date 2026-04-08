@@ -29,6 +29,11 @@ from train_latent_cyclegan import (  # noqa: E402
     _load_vae,
     decode_latents_to_images,
     load_yaml_config,
+    resolve_config_path,
+    resolve_data_style_dirs,
+    resolve_domain_dir,
+    resolve_experiment_root,
+    resolve_style_pair,
     resolve_vae_source,
 )
 
@@ -143,12 +148,6 @@ def _build_stem_index(root: Path) -> Dict[str, Path]:
     for p in _list_images(root):
         index[p.stem] = p
     return index
-
-
-def _resolve_domain_dir(base_dir: Path, domain_name: str, key_name: str) -> Path:
-    path = base_dir / domain_name
-    _require(path.exists(), f"{key_name} not found for domain '{domain_name}': {path}")
-    return path
 
 
 def _select_latent_paths(
@@ -415,7 +414,7 @@ def _phase0_parse_config(args: argparse.Namespace) -> EvalConfig:
     _require(isinstance(initial_eval_cfg, dict), "config.cyclegan_eval must be a dict")
 
     experiment_dir_raw = str(initial_eval_cfg.get("experiment_dir", "") or "").strip()
-    experiment_dir = Path("")
+    experiment_dir: Optional[Path] = None
     if experiment_dir_raw:
         experiment_dir_candidate = _resolve_repo_path(experiment_dir_raw)
         experiment_dir = experiment_dir_candidate
@@ -451,14 +450,23 @@ def _phase0_parse_config(args: argparse.Namespace) -> EvalConfig:
     _require(isinstance(eval_cfg, dict), "config.cyclegan_eval must be a dict")
     _require(isinstance(data_cfg, dict), "config.data must be a dict")
 
-    domain_A_name = str(eval_cfg.get("domain_A_name", "") or "").strip()
-    domain_B_name = str(eval_cfg.get("domain_B_name", "") or "").strip()
+    domain_A_name, domain_B_name = resolve_style_pair(
+        cfg,
+        fallback_a=eval_cfg.get("domain_A_name", ""),
+        fallback_b=eval_cfg.get("domain_B_name", ""),
+    )
 
-    base_latent_dir = _resolve_repo_path(args.base_latent_dir or eval_cfg.get("base_latent_dir", "") or "")
+    base_latent_dir = resolve_config_path(args.base_latent_dir or eval_cfg.get("base_latent_dir", "") or "", str(config_path))
     base_orig_rgb_dir = _resolve_repo_path(args.base_orig_rgb_dir or eval_cfg.get("base_orig_rgb_dir", "") or "")
     base_vae_recon_dir = _resolve_repo_path(args.base_vae_recon_dir or eval_cfg.get("base_vae_recon_dir", "") or "")
 
-    if experiment_dir:
+    if not str(base_latent_dir):
+        _, _, inferred_a_dir, inferred_b_dir = resolve_data_style_dirs(cfg, str(config_path))
+        shared_parent = inferred_a_dir.parent
+        if inferred_b_dir.parent == shared_parent:
+            base_latent_dir = shared_parent
+
+    if experiment_dir is not None:
         default_checkpoint_dir = experiment_dir / "model"
         default_generator_checkpoint_path = default_checkpoint_dir / "last.pt"
         default_eval_output_dir = experiment_dir / "eval"
@@ -468,9 +476,16 @@ def _phase0_parse_config(args: argparse.Namespace) -> EvalConfig:
             args.generator_checkpoint_path or default_generator_checkpoint_path
         )
     else:
-        default_checkpoint_dir = _resolve_repo_path(cfg.get("train", {}).get("checkpoint_dir", "outputs/model"))
+        exp_root = resolve_experiment_root(cfg, str(config_path))
+        default_checkpoint_dir = (
+            exp_root / "model" if str(exp_root) else _resolve_repo_path(cfg.get("train", {}).get("checkpoint_dir", "outputs/model"))
+        )
         default_generator_checkpoint_path = default_checkpoint_dir / "last.pt"
-        default_eval_output_dir = _resolve_repo_path(eval_cfg.get("eval_output_dir", "outputs/eval_latent"))
+        default_eval_output_dir = (
+            exp_root / "eval"
+            if str(exp_root)
+            else _resolve_repo_path(eval_cfg.get("eval_output_dir", "outputs/eval_latent"))
+        )
         eval_output_dir = _resolve_repo_path(
             args.eval_output_dir or eval_cfg.get("eval_output_dir", "") or default_eval_output_dir
         )
@@ -498,9 +513,9 @@ def _phase0_parse_config(args: argparse.Namespace) -> EvalConfig:
     max_eval_samples = int(eval_cfg.get("max_eval_samples", -1))
     eval_seed = int(eval_cfg.get("eval_seed", 42))
 
-    _require(domain_A_name, "cyclegan_eval.domain_A_name is required")
-    _require(domain_B_name, "cyclegan_eval.domain_B_name is required")
-    _require(str(base_latent_dir), "cyclegan_eval.base_latent_dir is required")
+    _require(domain_A_name, "config.style_a or cyclegan_eval.domain_A_name is required")
+    _require(domain_B_name, "config.style_b or cyclegan_eval.domain_B_name is required")
+    _require(str(base_latent_dir), "cyclegan_eval.base_latent_dir or config.data.path is required")
     _require(str(base_orig_rgb_dir), "cyclegan_eval.base_orig_rgb_dir is required")
     _require(str(base_vae_recon_dir), "cyclegan_eval.base_vae_recon_dir is required")
 
@@ -509,15 +524,16 @@ def _phase0_parse_config(args: argparse.Namespace) -> EvalConfig:
     _require(base_vae_recon_dir.exists(), f"base_vae_recon_dir not found: {base_vae_recon_dir}")
 
     # Validate domain subfolders for both directions in Phase 0.
-    _resolve_domain_dir(base_latent_dir, domain_A_name, "base_latent_dir")
-    _resolve_domain_dir(base_latent_dir, domain_B_name, "base_latent_dir")
-    _resolve_domain_dir(base_orig_rgb_dir, domain_A_name, "base_orig_rgb_dir")
-    _resolve_domain_dir(base_orig_rgb_dir, domain_B_name, "base_orig_rgb_dir")
-    _resolve_domain_dir(base_vae_recon_dir, domain_A_name, "base_vae_recon_dir")
-    _resolve_domain_dir(base_vae_recon_dir, domain_B_name, "base_vae_recon_dir")
+    resolve_domain_dir(base_latent_dir, domain_A_name, "base_latent_dir")
+    resolve_domain_dir(base_latent_dir, domain_B_name, "base_latent_dir")
+    resolve_domain_dir(base_orig_rgb_dir, domain_A_name, "base_orig_rgb_dir")
+    resolve_domain_dir(base_orig_rgb_dir, domain_B_name, "base_orig_rgb_dir")
+    resolve_domain_dir(base_vae_recon_dir, domain_A_name, "base_vae_recon_dir")
+    resolve_domain_dir(base_vae_recon_dir, domain_B_name, "base_vae_recon_dir")
 
-    eval_output_dir.mkdir(parents=True, exist_ok=True)
-    reference_cache_dir.mkdir(parents=True, exist_ok=True)
+    if not bool(getattr(args, "dry_run", False)):
+        eval_output_dir.mkdir(parents=True, exist_ok=True)
+        reference_cache_dir.mkdir(parents=True, exist_ok=True)
 
     return EvalConfig(
         shared_cfg=shared_cfg,
@@ -1061,6 +1077,32 @@ def _write_reports(direction: EvalDirection, metric_payload: Dict[str, Any]) -> 
     _log(f"[{direction.name}][Phase3] Saved CSV report to: {report_csv}")
 
 
+def _write_global_summary(eval_output_dir: Path, payloads: Dict[str, Dict[str, Any]]) -> None:
+    report_json = eval_output_dir / "metrics_report.json"
+    report_csv = eval_output_dir / "metrics.csv"
+
+    summary_payload = {name: payload["summary"] for name, payload in payloads.items()}
+    with open(report_json, "w", encoding="utf-8") as f:
+        json.dump(summary_payload, f, indent=2, ensure_ascii=False)
+
+    rows: List[Dict[str, Any]] = []
+    for direction_name, payload in payloads.items():
+        row = {"direction": direction_name}
+        row.update(payload["summary"])
+        rows.append(row)
+
+    if rows:
+        fields = ["direction"] + sorted({key for row in rows for key in row.keys() if key != "direction"})
+        with open(report_csv, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({k: row.get(k) for k in fields})
+
+    _log(f"[Done] Saved global JSON report to: {report_json}")
+    _log(f"[Done] Saved global CSV report to: {report_csv}")
+
+
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Latent CycleGAN evaluation in RGB space")
     p.add_argument("--config", type=str, default="configs/example.yaml")
@@ -1080,17 +1122,19 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--use_bf16_autocast", action="store_true", default=None)
     p.add_argument("--no_use_bf16_autocast", dest="use_bf16_autocast", action="store_false")
     p.add_argument("--force_regen_cache", action="store_true")
+    p.add_argument("--dry-run", action="store_true", help="Resolve config and planned outputs without evaluation")
     return p
 
 
-def _build_directions(ecfg: EvalConfig) -> List[EvalDirection]:
+def _build_directions(ecfg: EvalConfig, create_dirs: bool = True) -> List[EvalDirection]:
     def _mk(name: str, src_domain: str, tgt_domain: str) -> EvalDirection:
-        latent_src_dir = _resolve_domain_dir(ecfg.base_latent_dir, src_domain, "base_latent_dir")
-        orig_rgb_dir = _resolve_domain_dir(ecfg.base_orig_rgb_dir, src_domain, "base_orig_rgb_dir")
-        vae_recon_dir = _resolve_domain_dir(ecfg.base_vae_recon_dir, src_domain, "base_vae_recon_dir")
-        tgt_ref_dir = _resolve_domain_dir(ecfg.base_orig_rgb_dir, tgt_domain, "base_orig_rgb_dir")
+        latent_src_dir = resolve_domain_dir(ecfg.base_latent_dir, src_domain, "base_latent_dir")
+        orig_rgb_dir = resolve_domain_dir(ecfg.base_orig_rgb_dir, src_domain, "base_orig_rgb_dir")
+        vae_recon_dir = resolve_domain_dir(ecfg.base_vae_recon_dir, src_domain, "base_vae_recon_dir")
+        tgt_ref_dir = resolve_domain_dir(ecfg.base_orig_rgb_dir, tgt_domain, "base_orig_rgb_dir")
         out_dir = ecfg.eval_output_dir / name
-        out_dir.mkdir(parents=True, exist_ok=True)
+        if create_dirs:
+            out_dir.mkdir(parents=True, exist_ok=True)
         return EvalDirection(
             name=name,
             src_domain=src_domain,
@@ -1113,6 +1157,25 @@ def main() -> None:
 
     _log("[Phase0] Parsing YAML and applying CLI overrides...")
     ecfg = _phase0_parse_config(args)
+    if args.dry_run:
+        directions = _build_directions(ecfg, create_dirs=False)
+        _log("[DRY-RUN] Latent eval config resolved.")
+        _log(f"  config={Path(args.config).expanduser().resolve()}")
+        _log(f"  checkpoint={ecfg.generator_checkpoint_path}")
+        _log(f"  eval_output_dir={ecfg.eval_output_dir}")
+        _log(f"  reference_cache_dir={ecfg.reference_cache_dir}")
+        for direction in directions:
+            _log(f"  [{direction.name}] src={direction.src_domain} tgt={direction.tgt_domain}")
+            _log(f"    latent_src_dir={direction.latent_src_dir}")
+            _log(f"    orig_rgb_dir={direction.orig_rgb_dir}")
+            _log(f"    vae_recon_dir={direction.vae_recon_dir}")
+            _log(f"    tgt_ref_dir={direction.tgt_ref_dir}")
+            _log(f"    planned_dir={direction.out_dir}")
+            _log(f"    planned_file={direction.out_dir / ('eval_metrics_' + direction.name + '.json')}")
+            _log(f"    planned_file={direction.out_dir / ('eval_metrics_' + direction.name + '.csv')}")
+        _log(f"  planned_global_json={ecfg.eval_output_dir / 'metrics_report.json'}")
+        _log(f"  planned_global_csv={ecfg.eval_output_dir / 'metrics.csv'}")
+        return
 
     _log("[Setup] Loading dual generators from one checkpoint...")
     generators = _load_generators(ecfg)
@@ -1134,6 +1197,7 @@ def main() -> None:
     }
 
     directions = _build_directions(ecfg)
+    all_metric_payloads: Dict[str, Dict[str, Any]] = {}
     for direction in directions:
         _log(
             f"[{direction.name}] src={direction.src_domain} tgt={direction.tgt_domain} "
@@ -1164,6 +1228,9 @@ def main() -> None:
             phase2_outputs=phase2_outputs,
         )
         _write_reports(direction=direction, metric_payload=metric_payload)
+        all_metric_payloads[direction.name] = metric_payload
+
+    _write_global_summary(ecfg.eval_output_dir, all_metric_payloads)
 
 
 if __name__ == "__main__":

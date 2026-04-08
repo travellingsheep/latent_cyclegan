@@ -136,6 +136,8 @@ def make_experiment_config(
     vis_cfg = ensure_mapping(base_config, "visualization")
 
     base_config["exp_root"] = exp_root
+    if isinstance(data_cfg.get("path"), str) and data_cfg["path"]:
+        data_cfg["path"] = resolve_config_path_value(base_config_path, data_cfg["path"])
     if isinstance(data_cfg.get("a_dir"), str) and data_cfg["a_dir"]:
         data_cfg["a_dir"] = resolve_config_path_value(base_config_path, data_cfg["a_dir"])
     if isinstance(data_cfg.get("b_dir"), str) and data_cfg["b_dir"]:
