@@ -146,100 +146,118 @@ def build_experiment_record(
     }
 
 
-def discover_experiments(config_path: str, config: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """兼容单次训练与 sweep 配置，发现可展示的实验目录。"""
-    logging_cfg = config.get("logging", {})
+def list_directory_entries(directory: str) -> Tuple[List[str], List[str]]:
+    """列出当前目录的直接子文件夹与文件。"""
+    child_dirs: List[str] = []
+    child_files: List[str] = []
+    for child_name in sorted(os.listdir(directory), key=natural_sort_key):
+        child_path = os.path.join(directory, child_name)
+        if os.path.isdir(child_path):
+            child_dirs.append(child_path)
+        else:
+            child_files.append(child_path)
+    return child_dirs, child_files
+
+
+def build_experiment_from_directory(directory: str, config_path: str, root_config: Dict[str, Any]) -> Dict[str, Any]:
+    """当当前目录已经是叶子节点时，将其视为实验目录。"""
+    directory = os.path.abspath(directory)
+    logging_cfg = root_config.get("logging", {})
     if not isinstance(logging_cfg, dict):
         logging_cfg = {}
+    log_file = str(logging_cfg.get("log_file", "train_log.jsonl"))
 
-    log_file = str(logging_cfg.get("log_file", "train_log.jsonl") or "").strip()
-    if not log_file:
-        return []
-
-    experiments: Dict[str, Dict[str, Any]] = {}
-
-    current_log_path = resolve_log_path(config_path, config)
-    current_exp_dir = resolve_experiment_dir(config_path, config, current_log_path)
-    current_config_is_snapshot = os.path.abspath(config_path) == os.path.join(current_exp_dir, "config.yaml")
-    if os.path.exists(current_log_path) or current_config_is_snapshot:
-        experiments[current_exp_dir] = build_experiment_record(
-            exp_dir=current_exp_dir,
-            log_path=current_log_path,
-            config_path=config_path,
-            source="current_config",
+    if os.path.basename(directory) == "logs":
+        experiment_dir = os.path.dirname(directory)
+        experiment_config_path = os.path.join(experiment_dir, "config.yaml")
+        if os.path.exists(experiment_config_path):
+            selected_config_path = experiment_config_path
+            selected_config = load_yaml_config(selected_config_path)
+            log_path = resolve_log_path(selected_config_path, selected_config)
+            source = "selected_logs_dir_config"
+        else:
+            selected_config_path = os.path.abspath(config_path)
+            log_path = os.path.join(directory, log_file)
+            source = "selected_logs_dir_fallback"
+        return build_experiment_record(
+            exp_dir=experiment_dir,
+            log_path=log_path,
+            config_path=selected_config_path,
+            source=source,
         )
 
-    scan_root_path = resolve_visualize_scan_root(config_path, config)
+    experiment_config_path = os.path.join(directory, "config.yaml")
+    if os.path.exists(experiment_config_path):
+        selected_config_path = experiment_config_path
+        selected_config = load_yaml_config(selected_config_path)
+        log_path = resolve_log_path(selected_config_path, selected_config)
+        source = "selected_leaf_config"
+    else:
+        selected_config_path = os.path.abspath(config_path)
+        log_path = os.path.join(directory, "logs", log_file)
+        source = "selected_leaf_fallback"
+
+    return build_experiment_record(
+        exp_dir=directory,
+        log_path=log_path,
+        config_path=selected_config_path,
+        source=source,
+    )
+
+
+def render_directory_navigator(scan_root_path: str, config_path: str, config: Dict[str, Any]) -> Dict[str, Any] | None:
+    """逐层展示目录内容，直到选到叶子目录后再解析实验。"""
     if not scan_root_path:
-        return list(experiments.values())
+        st.warning("当前配置没有可用的 visualization.scan_root。")
+        return None
     if not os.path.isdir(scan_root_path):
-        return list(experiments.values())
-
-    for child_name in sorted(os.listdir(scan_root_path)):
-        child_path = os.path.join(scan_root_path, child_name)
-        if not os.path.isdir(child_path):
-            continue
-        child_log_path = os.path.join(child_path, "logs", log_file)
-        child_config_path = os.path.join(child_path, "config.yaml")
-        if not os.path.exists(child_log_path) and not os.path.exists(child_config_path):
-            continue
-        experiments[child_path] = build_experiment_record(
-            exp_dir=child_path,
-            log_path=child_log_path,
-            config_path=child_config_path,
-            source="scan_root",
-        )
-
-    discovered = list(experiments.values())
-    discovered.sort(key=lambda item: natural_sort_key(item["name"]))
-    return discovered
-
-
-def render_experiment_selector(experiments: List[Dict[str, Any]]) -> Dict[str, Any] | None:
-    """先展示检测到的实验目录，再按需选择一个实验加载。"""
-    if not experiments:
-        st.warning("当前配置下没有检测到可展示的实验目录。")
+        st.warning(f"扫描根目录不存在: {scan_root_path}")
         return None
 
-    st.subheader("检测到的实验目录")
-    for idx, experiment in enumerate(experiments, start=1):
-        status_parts = [
-            f"log={'yes' if experiment['has_log'] else 'no'}",
-            f"config={'yes' if experiment['has_config'] else 'no'}",
-            f"source={experiment['source']}",
-        ]
-        st.caption(f"{idx}. {experiment['name']} | {' | '.join(status_parts)}")
-        st.code(experiment["exp_dir"], language=None)
+    if "visualize_nav_root" not in st.session_state or st.session_state["visualize_nav_root"] != scan_root_path:
+        st.session_state["visualize_nav_root"] = scan_root_path
+        st.session_state["visualize_nav_current_dir"] = scan_root_path
 
-    option_values = [experiment["exp_dir"] for experiment in experiments]
-    option_labels = {
-        experiment["exp_dir"]: f"{experiment['name']} ({experiment['source']})"
-        for experiment in experiments
-    }
+    current_dir = st.session_state.get("visualize_nav_current_dir", scan_root_path)
+    if not os.path.isdir(current_dir) or not os.path.abspath(current_dir).startswith(os.path.abspath(scan_root_path)):
+        current_dir = scan_root_path
+        st.session_state["visualize_nav_current_dir"] = current_dir
 
-    if "selected_experiment_dir" not in st.session_state:
-        st.session_state["selected_experiment_dir"] = option_values[0]
-    if st.session_state["selected_experiment_dir"] not in option_values:
-        st.session_state["selected_experiment_dir"] = option_values[0]
+    child_dirs, child_files = list_directory_entries(current_dir)
 
-    selected_exp_dir = st.selectbox(
-        "选择要查看的实验目录",
-        options=option_values,
-        index=option_values.index(st.session_state["selected_experiment_dir"]),
-        format_func=lambda value: option_labels[value],
-        help="这里只做目录发现；只有在你选中某个实验后，页面才会读取该实验的配置与日志。",
-    )
-    st.session_state["selected_experiment_dir"] = selected_exp_dir
-    return next((experiment for experiment in experiments if experiment["exp_dir"] == selected_exp_dir), None)
+    st.subheader("目录导航")
+    st.write(f"扫描根目录: {scan_root_path}")
+    st.write(f"当前目录: {current_dir}")
 
+    parent_dir = os.path.dirname(current_dir.rstrip(os.sep))
+    can_go_up = os.path.abspath(current_dir) != os.path.abspath(scan_root_path)
+    if can_go_up and st.button("返回上一级", use_container_width=True):
+        st.session_state["visualize_nav_current_dir"] = parent_dir
+        st.rerun()
 
-def resolve_selected_log_path(experiment: Dict[str, Any]) -> str:
-    """优先读取所选实验自己的配置，以获得更好的兼容性。"""
-    selected_config_path = experiment["config_path"]
-    if os.path.exists(selected_config_path):
-        selected_config = load_yaml_config(selected_config_path)
-        return resolve_log_path(selected_config_path, selected_config)
-    return experiment["log_path"]
+    if child_dirs:
+        st.caption("当前层可进入的子文件夹")
+        next_dir = st.selectbox(
+            "选择一个子文件夹继续",
+            options=child_dirs,
+            format_func=lambda value: os.path.basename(value) or value,
+            key=f"dir-select::{current_dir}",
+            help="这里只展示当前层；选中后点击进入下一层。",
+        )
+        if st.button("进入选中文件夹", type="primary", use_container_width=True):
+            st.session_state["visualize_nav_current_dir"] = next_dir
+            st.rerun()
+
+    if child_files:
+        st.caption("当前层文件")
+        for file_path in child_files:
+            st.code(file_path, language=None)
+
+    if child_dirs:
+        return None
+
+    st.info("当前目录下没有子文件夹，已将其视为候选实验目录。")
+    return build_experiment_from_directory(current_dir, config_path, config)
 
 
 @st.cache_data(show_spinner=False)
@@ -372,6 +390,8 @@ def render_sidebar(default_config_path: str) -> str:
 
     if st.sidebar.button("加载配置", use_container_width=True):
         st.session_state["active_config_path"] = input_config_path.strip() or default_config_path
+        st.session_state.pop("visualize_nav_root", None)
+        st.session_state.pop("visualize_nav_current_dir", None)
         st.cache_data.clear()
 
     st.sidebar.divider()
@@ -473,12 +493,12 @@ def main() -> None:
 
     try:
         config = load_yaml_config(config_path)
-        experiments = discover_experiments(config_path, config)
+        scan_root_path = resolve_visualize_scan_root(config_path, config)
     except Exception as exc:
         st.error(f"加载配置失败: {exc}")
         return
 
-    selected_experiment = render_experiment_selector(experiments)
+    selected_experiment = render_directory_navigator(scan_root_path, config_path, config)
     if selected_experiment is None:
         return
 
@@ -486,11 +506,7 @@ def main() -> None:
     st.subheader("当前选中的实验")
     st.write(f"实验目录: {selected_experiment['exp_dir']}")
     st.write(f"实验配置: {selected_experiment['config_path']}")
-    try:
-        log_path = resolve_selected_log_path(selected_experiment)
-    except Exception as exc:
-        st.error(f"加载所选实验配置失败: {exc}")
-        return
+    log_path = selected_experiment["log_path"]
     st.write(f"目标日志文件: {log_path}")
 
     if not os.path.exists(log_path):
