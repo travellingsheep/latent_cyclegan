@@ -1,5 +1,6 @@
 import argparse
 import csv
+import itertools
 import os
 import subprocess
 import sys
@@ -10,8 +11,8 @@ from typing import Any, Dict, List, TextIO
 import yaml
 
 
-# 固定的扫描列表，用于判别器谱归一化消融实验。
-SWEEP_DISCRIMINATOR_SN = [True, False]
+# 默认排除的风格目录。
+EXCLUDED_STYLES = {"ukiyoe"}
 
 
 def now_str() -> str:
@@ -78,6 +79,18 @@ def resolve_exp_root(config_path: str, config: Dict[str, Any]) -> str:
     return os.path.abspath(os.path.join(config_dir, exp_root))
 
 
+def resolve_data_root(config_path: str, config: Dict[str, Any]) -> str:
+    """从配置文件读取 data.path，并解析为绝对路径。"""
+    data_cfg = config.get("data")
+    if not isinstance(data_cfg, dict):
+        raise ValueError("配置项 data 缺失或不是字典")
+
+    data_path = data_cfg.get("path")
+    if not isinstance(data_path, str) or not data_path.strip():
+        raise ValueError("配置项 data.path 缺失或为空，无法自动扫描风格目录")
+    return resolve_config_path_value(config_path, data_path)
+
+
 def resolve_config_path_value(config_path: str, path_value: str) -> str:
     """将配置里的路径解析为绝对路径，避免快照迁移后相对路径失效。"""
     if os.path.isabs(path_value):
@@ -99,6 +112,30 @@ def resolve_model_name_or_path(config_path: str, value: str) -> str:
     if os.path.exists(candidate):
         return candidate
     return value
+
+
+def discover_styles(data_root: str) -> List[str]:
+    """读取 data.path 下的一级子目录，并过滤掉排除项。"""
+    if not os.path.exists(data_root):
+        raise FileNotFoundError(f"配置项 data.path 不存在: {data_root}")
+    if not os.path.isdir(data_root):
+        raise NotADirectoryError(f"配置项 data.path 不是目录: {data_root}")
+
+    styles = sorted(
+        entry
+        for entry in os.listdir(data_root)
+        if os.path.isdir(os.path.join(data_root, entry)) and entry not in EXCLUDED_STYLES
+    )
+    if len(styles) < 2:
+        raise ValueError(
+            f"可用于 sweep 的风格数量不足 2 个。当前 data.path={data_root}, styles={styles}"
+        )
+    return styles
+
+
+def build_style_pairs(styles: List[str]) -> List[List[str]]:
+    """构造不重复的风格两两组合。"""
+    return [list(pair) for pair in itertools.combinations(styles, 2)]
 
 
 def dump_yaml_config(config_path: str, config: Dict[str, Any]) -> None:
@@ -123,19 +160,21 @@ def make_experiment_config(
     base_config_path: str,
     exp_root: str,
     exp_name: str,
-    use_discriminator_sn: bool,
+    style_a: str,
+    style_b: str,
 ) -> Dict[str, Any]:
     """基于基础配置生成单次实验的配置快照。"""
     exp_dir = os.path.join(exp_root, exp_name)
 
     data_cfg = ensure_mapping(base_config, "data")
     shared_cfg = ensure_mapping(base_config, "shared")
-    model_cfg = ensure_mapping(base_config, "model")
     train_cfg = ensure_mapping(base_config, "train")
     logging_cfg = ensure_mapping(base_config, "logging")
     vis_cfg = ensure_mapping(base_config, "visualization")
 
     base_config["exp_root"] = exp_root
+    base_config["style_a"] = style_a
+    base_config["style_b"] = style_b
     if isinstance(data_cfg.get("path"), str) and data_cfg["path"]:
         data_cfg["path"] = resolve_config_path_value(base_config_path, data_cfg["path"])
     if isinstance(data_cfg.get("a_dir"), str) and data_cfg["a_dir"]:
@@ -146,7 +185,6 @@ def make_experiment_config(
         shared_cfg["vae_model_name_or_path"] = resolve_model_name_or_path(
             base_config_path, shared_cfg["vae_model_name_or_path"]
         )
-    model_cfg["use_discriminator_sn"] = bool(use_discriminator_sn)
     train_cfg["checkpoint_dir"] = os.path.join(exp_dir, "model")
     logging_cfg["log_dir"] = os.path.join(exp_dir, "logs")
     vis_cfg["out_dir"] = os.path.join(exp_dir, "vis")
@@ -199,7 +237,20 @@ def run_experiment(repo_root: str, exp_dir: str, config_path: str, log_file: str
         for thread in threads:
             thread.start()
 
-        return_code = process.wait()
+        try:
+            return_code = process.wait()
+        except KeyboardInterrupt:
+            sweep_log("[WARN] KeyboardInterrupt received. Stopping current training process...")
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    return_code = process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    sweep_log("[WARN] Training process did not exit after SIGTERM; killing it now.")
+                    process.kill()
+                    return_code = process.wait()
+            else:
+                return_code = process.returncode
 
         for thread in threads:
             thread.join()
@@ -225,6 +276,55 @@ def write_summary_csv(summary_path: str, results: List[Dict[str, Any]]) -> None:
         writer.writeheader()
         for result in results:
             writer.writerow({key: result.get(key, "") for key in fieldnames})
+
+
+def load_summary_csv(summary_path: str) -> List[Dict[str, Any]]:
+    """读取已有的 sweep 汇总结果；若不存在则返回空列表。"""
+    if not os.path.exists(summary_path):
+        return []
+
+    with open(summary_path, "r", encoding="utf-8", newline="") as file_obj:
+        reader = csv.DictReader(file_obj)
+        return [dict(row) for row in reader]
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def merge_result_records(existing: Dict[str, Any], new_result: Dict[str, Any]) -> Dict[str, Any]:
+    """按实验名合并单条结果，累计耗时并用最新状态覆盖旧状态。"""
+    merged = dict(existing)
+    merged.update(new_result)
+
+    merged["duration_sec"] = round(
+        _safe_float(existing.get("duration_sec", 0.0)) + _safe_float(new_result.get("duration_sec", 0.0)),
+        2,
+    )
+    return merged
+
+
+def upsert_result(results: List[Dict[str, Any]], new_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """将新结果合并进汇总列表；若已存在同名实验则原地更新。"""
+    experiment_name = str(new_result.get("experiment_name", ""))
+    for idx, existing in enumerate(results):
+        if str(existing.get("experiment_name", "")) == experiment_name:
+            results[idx] = merge_result_records(existing, new_result)
+            return results
+
+    results.append(new_result)
+    return results
+
+
+def find_result(results: List[Dict[str, Any]], experiment_name: str) -> Dict[str, Any]:
+    """按实验名查找已有汇总记录；未找到时返回空字典。"""
+    for result in results:
+        if str(result.get("experiment_name", "")) == experiment_name:
+            return result
+    return {}
 
 
 def print_summary_table(results: List[Dict[str, Any]]) -> None:
@@ -264,7 +364,7 @@ def print_summary_table(results: List[Dict[str, Any]]) -> None:
 
 
 def main() -> None:
-    """按预定义 SN 开关列表循环执行消融实验。"""
+    """按 data.path 下的风格目录两两组合执行 sweep。"""
     args = parse_args()
     repo_root = get_repo_root()
     base_config_path = os.path.abspath(args.config if args.config else get_base_config_path(repo_root))
@@ -274,26 +374,37 @@ def main() -> None:
 
     base_config = load_yaml_config(base_config_path)
     exp_root = resolve_exp_root(base_config_path, base_config)
+    data_root = resolve_data_root(base_config_path, base_config)
+    styles = discover_styles(data_root)
+    style_pairs = build_style_pairs(styles)
     os.makedirs(exp_root, exist_ok=True)
 
     summary_path = os.path.join(exp_root, "sweep_summary.csv")
-    results: List[Dict[str, Any]] = []
+    results = load_summary_csv(summary_path)
 
     sweep_log(f"Using Python executable: {sys.executable}")
     sweep_log(f"Base config: {base_config_path}")
     sweep_log(f"Experiment root: {exp_root}")
+    sweep_log(f"Data root: {data_root}")
+    sweep_log(f"Excluded styles: {sorted(EXCLUDED_STYLES)}")
+    sweep_log(f"Discovered styles ({len(styles)}): {styles}")
+    sweep_log(f"Planned style pairs ({len(style_pairs)}): {style_pairs}")
     sweep_log(f"Dry-run mode: {args.dry_run}")
 
-    for use_discriminator_sn in SWEEP_DISCRIMINATOR_SN:
-        exp_name = "discriminator_sn_on" if use_discriminator_sn else "discriminator_sn_off"
+    for style_a, style_b in style_pairs:
+        exp_name = f"{style_a}__{style_b}"
         exp_dir = os.path.join(exp_root, exp_name)
         os.makedirs(exp_dir, exist_ok=True)
+        existing_result = find_result(results, exp_name)
+        existing_status = str(existing_result.get("status", "")).strip().upper()
+
+        if existing_status == "OK":
+            sweep_log(f"[SKIP] Skip completed experiment: {exp_name}")
+            continue
 
         print()
         sweep_log("=" * 100)
-        sweep_log(
-            f"Starting sweep run for {exp_name} (use_discriminator_sn={use_discriminator_sn})"
-        )
+        sweep_log(f"Starting sweep run for {exp_name} (style_a={style_a}, style_b={style_b})")
         sweep_log(f"Experiment directory: {os.path.abspath(exp_dir)}")
         sweep_log("=" * 100)
 
@@ -308,7 +419,8 @@ def main() -> None:
                 base_config_path=base_config_path,
                 exp_root=exp_root,
                 exp_name=exp_name,
-                use_discriminator_sn=use_discriminator_sn,
+                style_a=style_a,
+                style_b=style_b,
             )
             dump_yaml_config(snapshot_path, run_config)
 
@@ -336,10 +448,11 @@ def main() -> None:
                     sweep_log(f"[OK] Sweep run finished for {exp_name}")
 
             duration_sec = time.time() - start_time
-            results.append(
+            upsert_result(
+                results,
                 {
                     "experiment_name": exp_name,
-                    "use_discriminator_sn": use_discriminator_sn,
+                    "use_discriminator_sn": "",
                     "status": status,
                     "return_code": return_code,
                     "duration_sec": round(duration_sec, 2),
@@ -347,17 +460,39 @@ def main() -> None:
                     "config_path": snapshot_path,
                     "log_file": log_file,
                     "message": message,
-                }
+                },
             )
             write_summary_csv(summary_path, results)
             print_summary_table(results)
+        except KeyboardInterrupt:
+            sweep_log(f"\033[93m[WARN] Sweep interrupted during {exp_name}. Saving current status.\033[0m")
+            duration_sec = time.time() - start_time
+            upsert_result(
+                results,
+                {
+                    "experiment_name": exp_name,
+                    "use_discriminator_sn": "",
+                    "status": "INTERRUPTED",
+                    "return_code": 130,
+                    "duration_sec": round(duration_sec, 2),
+                    "exp_dir": os.path.abspath(exp_dir),
+                    "config_path": snapshot_path,
+                    "log_file": log_file,
+                    "message": "Sweep interrupted by user.",
+                },
+            )
+            write_summary_csv(summary_path, results)
+            print_summary_table(results)
+            sweep_log("Sweep stopped by user interrupt.")
+            return
         except Exception as exc:
             sweep_log(f"\033[91m[ERROR] Sweep run crashed for {exp_name}: {exc}\033[0m")
             duration_sec = time.time() - start_time
-            results.append(
+            upsert_result(
+                results,
                 {
                     "experiment_name": exp_name,
-                    "use_discriminator_sn": use_discriminator_sn,
+                    "use_discriminator_sn": "",
                     "status": "CRASHED",
                     "return_code": -1,
                     "duration_sec": round(duration_sec, 2),
@@ -365,7 +500,7 @@ def main() -> None:
                     "config_path": snapshot_path,
                     "log_file": log_file,
                     "message": str(exc),
-                }
+                },
             )
             write_summary_csv(summary_path, results)
             print_summary_table(results)

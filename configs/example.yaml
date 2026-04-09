@@ -1,7 +1,7 @@
 # Latent CycleGAN config (SD1.5 VAE latent .pt)
 
 # Ablation sweep root directory. run_sweep.py will overwrite this field in each snapshot.
-exp_root: "/home/winchester/projects/latent_cyclegan_outputs/hayao2photo/v1.0-baseline_use_residual_use_sn_full_dataset_bs_1"
+exp_root: "/home/winchester/projects/latent_cyclegan_outputs/run_5_styles/v1.0-baseline_use_residual_use_sn_full_dataset_bs_1"
 style_a: "Hayao"
 style_b: "photo"
 
